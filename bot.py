@@ -111,20 +111,15 @@ class JoinState(StatesGroup):
 # -----------------------------------------------------------------------------
 
 def _which_ffmpeg() -> str:
-    """Return an ffmpeg executable path. Prefer imageio-ffmpeg when available."""
     if imageio_ffmpeg is not None:
         try:
             return imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:
             pass
-
     for candidate in ("ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
         if shutil.which(candidate) or Path(candidate).exists():
             return candidate
-
-    raise RuntimeError(
-        "ffmpeg is not available. Install ffmpeg or add imageio-ffmpeg to requirements."
-    )
+    raise RuntimeError("ffmpeg is not available.")
 
 
 FFMPEG = _which_ffmpeg()
@@ -236,36 +231,15 @@ def _overlay_watermark(
 ) -> Image.Image:
     base = frame.convert("RGBA")
     wm = watermark.convert("RGBA")
-
     target_w = max(64, int(base.width * percent / 100))
     target_w = min(target_w, max(64, base.width - 2 * margin))
     wm = _resize_watermark(wm, target_w)
-
     x = base.width - wm.width - margin
     y = base.height - wm.height - margin
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     overlay.paste(wm, (x, y), wm)
     out = Image.alpha_composite(base, overlay)
     return out.convert("RGB")
-
-
-def _extract_frame_sync(video_path: str, frame_path: str, at_seconds: float = 1.0) -> None:
-    cmd = [
-        FFMPEG,
-        "-y",
-        "-ss",
-        str(at_seconds),
-        "-i",
-        video_path,
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        frame_path,
-    ]
-    result = __import__("subprocess").run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Frame extraction failed: {result.stderr[-1000:]}")
 
 
 def build_preview_collage(
@@ -532,7 +506,6 @@ async def resolve_join_target(bot: Bot, raw_value: str) -> dict[str, Any]:
     raw = raw_value.strip()
     if not raw:
         raise ValueError("ورودی خالی است.")
-
     if raw.startswith("@"):
         ref: Any = raw
     elif raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
@@ -547,18 +520,15 @@ async def resolve_join_target(bot: Bot, raw_value: str) -> dict[str, Any]:
         ref = int(raw)
     else:
         raise ValueError("فرمت لینک نامعتبر است. از @username یا لینک public t.me استفاده کنید.")
-
     chat = await bot.get_chat(ref)
     username = getattr(chat, "username", None)
     title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or "کانال"
-
     if not username:
         if isinstance(ref, int):
             raise ValueError(
                 "این چت یوزرنیم عمومی ندارد. برای جوین اجباری، لطفاً کانال public با @username اضافه کنید."
             )
         raise ValueError("برای ساخت دکمه عضویت، چت باید public و دارای یوزرنیم باشد.")
-
     return {"chat_id": int(chat.id), "url": f"https://t.me/{username}", "title": title, "label": ""}
 
 
@@ -597,13 +567,11 @@ async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
     if not mapping:
         await bot.send_message(chat_id, "این لینک نامعتبر است یا ویدیو دیگر در دسترس نیست.")
         return
-
     warning = await bot.send_message(
         chat_id,
         "⚠️ ویدیو را همین حالا ذخیره کنید.\n"
         "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
     )
-
     try:
         copied = await bot.copy_message(
             chat_id=chat_id,
@@ -617,7 +585,6 @@ async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
     except TelegramForbiddenError:
         await warning.edit_text("امکان ارسال پیام به این کاربر وجود ندارد.")
         return
-
     asyncio.create_task(
         delete_later(bot, chat_id, [warning.message_id, copied_message_id], 10)
     )
@@ -628,7 +595,6 @@ async def handle_user_start_flow(message: Message, payload: str) -> None:
     if missing:
         await send_join_required_prompt(message, payload)
         return
-
     if payload:
         await deliver_user_video(message.bot, message.chat.id, payload)
     else:
@@ -676,7 +642,7 @@ def is_admin(user_id: int) -> bool:
 def get_bot_username() -> str:
     if BOT_USERNAME:
         return BOT_USERNAME.lstrip("@")
-    raise RuntimeError("BOT_USERNAME is not known yet. It will be fetched on startup.")
+    raise RuntimeError("BOT_USERNAME is not known yet.")
 
 
 def build_start_link(token: str) -> str:
@@ -718,31 +684,26 @@ async def ensure_bot_username(bot: Bot) -> str:
 # Admin handlers
 # -----------------------------------------------------------------------------
 
-# --- Ignore group messages completely ---
 @router.message(F.chat.type.in_({"group", "supergroup", "channel"}))
 async def ignore_groups(message: Message) -> None:
-    # Silently ignore all messages from groups/channels
     return
 
-# --- Private chat handlers only ---
+
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext) -> None:
     payload = ""
     if message.text and " " in message.text:
         payload = message.text.split(" ", 1)[1].strip()
-
     if is_admin(message.from_user.id):
         if payload:
             await message.answer("پنل ادمین", reply_markup=admin_keyboard())
             return
-
         try:
             settings = await get_settings(db_pool)
             has_wm = bool(settings.get("watermark_png"))
         except Exception as e:
             logger.exception("Admin settings load failed: %s", e)
             has_wm = False
-
         text = (
             "👋 <b>پنل ادمین</b>\n\n"
             f"واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
@@ -750,16 +711,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         )
         await message.answer(text, reply_markup=admin_keyboard())
         return
-
     missing = await get_missing_joins(message.bot, message.from_user.id)
     if missing:
         await send_join_required_prompt(message, payload)
         return
-
     if not payload:
         await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
         return
-
     await deliver_user_video(message.bot, message.chat.id, payload)
 
 
@@ -770,11 +728,9 @@ async def cb_join_check(call: CallbackQuery) -> None:
         payload = call.data.split(":", 2)[2]
     except Exception:
         payload = "_"
-
     if not call.from_user:
         await call.answer("Not allowed", show_alert=True)
         return
-
     missing = await get_missing_joins(call.bot, call.from_user.id)
     if missing:
         await call.answer("هنوز همه عضویت‌ها کامل نشده است.", show_alert=True)
@@ -788,13 +744,11 @@ async def cb_join_check(call: CallbackQuery) -> None:
         except Exception:
             pass
         return
-
     await call.answer("عضویت تأیید شد")
     try:
         await call.message.delete()
     except Exception:
         pass
-
     if payload and payload != "_":
         await deliver_user_video(call.bot, call.message.chat.id, payload)
     else:
@@ -866,12 +820,10 @@ async def cb_join_remove_item(call: CallbackQuery) -> None:
     except Exception:
         await call.answer("Invalid selection", show_alert=True)
         return
-
     entries = renumber_join_links(await get_join_links(db_pool))
     if idx < 0 or idx >= len(entries):
         await call.answer("Invalid selection", show_alert=True)
         return
-
     removed = entries.pop(idx)
     await save_join_links(db_pool, entries)
     await call.message.answer(
@@ -898,25 +850,20 @@ async def cb_join_back(call: CallbackQuery) -> None:
 async def receive_join_links(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-
     if not message.text:
         await message.answer("لطفاً لینک‌ها را به صورت متنی ارسال کنید.")
         return
-
     lines = [line.strip() for line in message.text.splitlines() if line.strip()]
     if not lines:
         await message.answer("هیچ لینکی دریافت نشد.")
         return
-
     if not db_pool:
         await message.answer("Database is not ready yet.")
         return
-
     current = renumber_join_links(await get_join_links(db_pool))
     seen_chat_ids = {item["chat_id"] for item in current}
     added = 0
     errors: list[str] = []
-
     for raw in lines:
         try:
             target = await resolve_join_target(message.bot, raw)
@@ -927,11 +874,9 @@ async def receive_join_links(message: Message, state: FSMContext) -> None:
             added += 1
         except Exception as exc:
             errors.append(f"• {raw} → {exc}")
-
     current = renumber_join_links(current)
     await save_join_links(db_pool, current)
     await state.clear()
-
     msg = f"✅ {added} لینک جدید اضافه شد."
     if errors:
         msg += "\n\n⚠️ برخی موارد نامعتبر بودند:\n" + "\n".join(errors[:5])
@@ -991,34 +936,27 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
 async def receive_watermark(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-
     doc = message.document
     if not doc:
         await message.answer("Please send the watermark as a PNG document.")
         return
-
     if doc.file_size and doc.file_size > MAX_WATERMARK_BYTES:
         await message.answer("The watermark is too large. Maximum allowed size is 5 MB.")
         return
-
     if doc.mime_type != "image/png" and not (doc.file_name or "").lower().endswith(".png"):
         await message.answer("The file must be a PNG.")
         return
-
     if not db_pool:
         await message.answer("Database is not ready yet.")
         return
-
     file = await message.bot.get_file(doc.file_id)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
         tmp_path = tmp.name
         await message.bot.download_file(file.file_path, destination=tmp)
-
     try:
         with open(tmp_path, "rb") as f:
             png_bytes = f.read()
         Image.open(BytesIO(png_bytes)).verify()
-
         await save_watermark(db_pool, png_bytes, doc.file_name or "watermark.png")
         await message.answer("✅ Watermark saved. It will remain fixed until you change it again.")
         await state.clear()
@@ -1041,10 +979,6 @@ def _is_video_message(message: Message) -> bool:
 
 
 async def download_admin_video(message: Message) -> tuple[str, str, int]:
-    """
-    Download the admin's video using aiohttp with a large timeout.
-    Returns (temp_path, filename, file_size).
-    """
     if message.video:
         file_id = message.video.file_id
         filename = message.video.file_name or "video.mp4"
@@ -1060,34 +994,42 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
     try:
         file = await message.bot.get_file(file_id)
     except TelegramBadRequest as exc:
-        raise ValueError(
-            "تلگرام اجازه دسترسی به این فایل را از طریق Bot API نمی‌دهد. "
-            "لطفاً فایل را کمی کوچک‌تر یا به صورت فشرده‌تر ارسال کنید."
-        ) from exc
+        # Maybe the file is too large or inaccessible
+        raise ValueError(f"خطا در دریافت اطلاعات فایل از تلگرام: {exc}") from exc
 
     file_path = file.file_path
     if not file_path:
         raise ValueError("Could not obtain file path from Telegram.")
 
-    # Prepare a temp file
     suffix = Path(filename).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
 
-    # Download using aiohttp with a generous timeout
     url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    timeout = aiohttp.ClientTimeout(total=300, connect=60, sock_read=120)
+    timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_read=300)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                # Try to read error message from Telegram
-                error_text = await response.text()
-                raise ValueError(f"Download failed with status {response.status}: {error_text[:200]}")
-            # Stream to file
-            with open(tmp_path, "wb") as f:
-                async for chunk in response.content.iter_chunked(8192):
-                    f.write(chunk)
+    logger.info(f"Starting download of {filename} ({file_size} bytes) from {url}")
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise ValueError(f"Download failed with status {response.status}: {error_text[:200]}")
+                with open(tmp_path, "wb") as f:
+                    downloaded = 0
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded % (10 * 1024 * 1024) == 0:
+                            logger.info(f"Downloaded {downloaded // (1024*1024)} MB so far...")
+                logger.info(f"Download complete: {downloaded} bytes")
+    except asyncio.TimeoutError:
+        safe_unlink(tmp_path)
+        raise ValueError("زمان دانلود به پایان رسید. ممکن است فایل بسیار بزرگ باشد.")
+    except Exception as e:
+        safe_unlink(tmp_path)
+        raise ValueError(f"خطا در دانلود: {str(e)}")
 
     return tmp_path, filename, file_size
 
@@ -1096,21 +1038,14 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
 async def admin_video_entry(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-
-    # If we are waiting for the watermark PNG, do not process video here.
     if await state.get_state() == WatermarkState.waiting_for_png.state:
         return
-
     if not _is_video_message(message):
         return
-
     settings = await get_watermark(db_pool)
     if not settings:
         await message.answer("Please set the watermark first using the admin panel.")
         return
-
-    watermark_bytes, watermark_name = settings
-
     if not db_pool:
         await message.answer("Database is not ready yet.")
         return
@@ -1133,9 +1068,8 @@ async def admin_video_entry(message: Message, state: FSMContext) -> None:
         with Image.open(frame_path) as im:
             frame_width, frame_height = im.size
 
-        # Build the collage in a thread so Pillow does not block the event loop.
         def _build() -> tuple[int, int]:
-            return build_preview_collage(frame_path, watermark_bytes, collage_path)
+            return build_preview_collage(frame_path, settings[0], collage_path)
 
         base_w, base_h = await asyncio.to_thread(_build)
 
@@ -1174,14 +1108,12 @@ async def cb_choose_size(call: CallbackQuery) -> None:
     if not call.from_user or not is_admin(call.from_user.id):
         await call.answer("Not allowed", show_alert=True)
         return
-
     try:
         _, job_id, idx_s = call.data.split(":")
         idx = int(idx_s)
     except Exception:
         await call.answer("Invalid selection", show_alert=True)
         return
-
     job = JOBS.get(job_id)
     if not job:
         await call.answer("This preview expired or is already processed.", show_alert=True)
@@ -1192,18 +1124,14 @@ async def cb_choose_size(call: CallbackQuery) -> None:
     if idx < 0 or idx >= len(PREVIEW_SIZES):
         await call.answer("Invalid size selection", show_alert=True)
         return
-
     job.status = "queued"
     job.chosen_index = idx
     size_percent = PREVIEW_SIZES[idx]
-
     try:
         await call.message.delete()
     except Exception:
         pass
-
     await call.answer(f"Selected {size_percent}%")
-
     asyncio.create_task(process_job(call.bot, job_id))
 
 
@@ -1211,26 +1139,21 @@ async def process_job(bot: Bot, job_id: str) -> None:
     job = JOBS.get(job_id)
     if not job:
         return
-
     async with PROCESS_LOCK:
         job = JOBS.get(job_id)
         if not job:
             return
-
         job.status = "processing"
         settings = await get_watermark(db_pool)
         if not settings:
             await bot.send_message(job.admin_id, "Watermark is missing. Please set it again.")
             cleanup_job(job_id)
             return
-
         watermark_bytes, watermark_name = settings
         selected_percent = PREVIEW_SIZES[job.chosen_index or 0]
-
         temp_dir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
         resized_wm_path = str(temp_dir / "watermark.png")
         output_path = str(temp_dir / "final.mp4")
-
         try:
             await asyncio.to_thread(
                 resize_watermark_for_video,
@@ -1239,12 +1162,10 @@ async def process_job(bot: Bot, job_id: str) -> None:
                 job.frame_width,
                 resized_wm_path,
             )
-
             await bot.send_message(
                 job.admin_id,
                 f"⏳ Rendering video with <b>{selected_percent}%</b> watermark..."
             )
-
             await render_video_with_watermark(
                 input_path=job.source_path,
                 watermark_path=resized_wm_path,
@@ -1252,7 +1173,6 @@ async def process_job(bot: Bot, job_id: str) -> None:
                 selected_percent=selected_percent,
                 frame_width=job.frame_width,
             )
-
             token = make_token()
             sent = await bot.send_video(
                 chat_id=STORAGE_CHANNEL,
@@ -1260,7 +1180,6 @@ async def process_job(bot: Bot, job_id: str) -> None:
                 caption=f"Watermarked video ({selected_percent}%)",
                 supports_streaming=True,
             )
-
             channel_message_id = sent.message_id
             await save_video_mapping(
                 db_pool,
@@ -1268,14 +1187,12 @@ async def process_job(bot: Bot, job_id: str) -> None:
                 channel_message_id=channel_message_id,
                 original_filename=job.source_filename,
             )
-
             link = build_start_link(token)
             await bot.send_message(
                 job.admin_id,
                 "✅ Video stored in the channel.\n"
                 f"🔗 Link:\n<code>{link}</code>"
             )
-
             job.status = "done"
         except Exception as exc:
             job.status = "failed"
@@ -1299,10 +1216,6 @@ def cleanup_job(job_id: str) -> None:
         pass
 
 
-# -----------------------------------------------------------------------------
-# Fallback / admin help
-# -----------------------------------------------------------------------------
-
 @router.message(Command("help"), F.chat.type == "private")
 async def help_cmd(message: Message) -> None:
     if is_admin(message.from_user.id):
@@ -1325,16 +1238,12 @@ async def on_startup(bot: Bot) -> None:
     await ensure_bot_username(bot)
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
-
     if WEBHOOK_BASE_URL:
         webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
         logger.info("Webhook set to %s", webhook_url)
     else:
-        logger.warning(
-            "WEBHOOK_BASE_URL is empty; webhook will not be registered. "
-            "On Render, it should fall back to RENDER_EXTERNAL_URL automatically."
-        )
+        logger.warning("WEBHOOK_BASE_URL is empty; webhook not registered.")
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -1342,7 +1251,6 @@ async def on_shutdown(bot: Bot) -> None:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
-
     global db_pool
     if db_pool is not None:
         try:
@@ -1350,7 +1258,6 @@ async def on_shutdown(bot: Bot) -> None:
         except Exception:
             pass
         db_pool = None
-
     try:
         await bot.session.close()
     except Exception:
@@ -1359,18 +1266,14 @@ async def on_shutdown(bot: Bot) -> None:
 
 async def init_app() -> web.Application:
     global db_pool
-
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1, statement_cache_size=0, command_timeout=60)
     await init_db(db_pool)
-
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
