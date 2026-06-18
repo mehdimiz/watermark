@@ -67,7 +67,7 @@ if not USER_SESSION_STRING:
     logging.warning("USER_SESSION_STRING is not set. Large file downloads will fall back to Bot API.")
 
 MAX_WATERMARK_BYTES = 5 * 1024 * 1024
-MAX_VIDEO_BYTES = 20 * 1024 * 1024  # Bot API limit (bypassed by Telethon)
+MAX_VIDEO_BYTES = 20 * 1024 * 1024
 PREVIEW_TILE_SIZE = (640, 360)
 PREVIEW_SIZES = [18, 26, 34, 42]
 WATERMARK_MARGIN = 20
@@ -154,24 +154,17 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 
 
 async def check_video_file(file_path: str) -> bool:
-    """Check if the video file is valid and has metadata (moov atom)."""
-    # بررسی وجود فایل
+    """Check if the video file is valid and has metadata."""
     if not os.path.exists(file_path):
         return False
-    # بررسی با ffmpeg
     cmd = [FFMPEG, "-v", "error", "-i", file_path, "-f", "null", "-"]
     code, _, err = await run_cmd(cmd)
-    if code != 0:
-        return False
-    # بررسی وجود moov atom
-    cmd2 = [FFMPEG, "-v", "error", "-i", file_path, "-c", "copy", "-f", "null", "-"]
-    code2, _, err2 = await run_cmd(cmd2)
-    return code2 == 0
+    return code == 0
 
 
 async def repair_video_file(input_path: str, output_path: str) -> bool:
-    """Repair video file by remuxing with faststart (moves moov atom to start)."""
-    # روش 1: کپی ساده با faststart (حفظ کیفیت)
+    """Repair video file by remuxing with faststart."""
+    # روش 1: کپی با faststart
     cmd = [
         FFMPEG, "-y",
         "-err_detect", "ignore_err",
@@ -184,7 +177,7 @@ async def repair_video_file(input_path: str, output_path: str) -> bool:
     if code == 0 and await check_video_file(output_path):
         return True
 
-    # روش 2: تبدیل کامل با libx264 (اگر روش اول جواب نداد)
+    # روش 2: تبدیل کامل (برای فایل‌های خراب‌تر)
     cmd2 = [
         FFMPEG, "-y",
         "-err_detect", "ignore_err",
@@ -205,19 +198,14 @@ async def repair_video_file(input_path: str, output_path: str) -> bool:
 
 
 async def extract_frame(video_path: str, out_path: str, at_seconds: float = 1.0) -> None:
-    # First, check if the video is valid
     if not await check_video_file(video_path):
-        # Try to repair
         temp_dir = Path(video_path).parent / "repair"
         temp_dir.mkdir(exist_ok=True)
         repaired_path = str(temp_dir / "repaired.mp4")
         if await repair_video_file(video_path, repaired_path):
             video_path = repaired_path
         else:
-            raise RuntimeError(
-                "ویدیو خراب است یا فرمت آن پشتیبانی نمی‌شود. "
-                "لطفاً فایل را دوباره ارسال کنید یا از فرمت دیگری استفاده کنید."
-            )
+            raise RuntimeError("ویدیو خراب است و قابل ترمیم نیست.")
 
     cmd = [FFMPEG, "-y", "-ss", str(at_seconds), "-i", video_path, "-frames:v", "1", "-q:v", "2", out_path]
     code, _, err = await run_cmd(cmd)
@@ -232,7 +220,6 @@ async def render_video_with_watermark(
     selected_percent: int,
     frame_width: int,
 ) -> None:
-    # Also check input video before rendering
     if not await check_video_file(input_path):
         temp_dir = Path(input_path).parent / "repair"
         temp_dir.mkdir(exist_ok=True)
@@ -752,24 +739,18 @@ async def ensure_bot_username(bot: Bot) -> str:
 # -----------------------------------------------------------------------------
 
 async def download_file_with_telethon(file_id: str, save_path: str) -> bool:
-    """Download file using Telethon with proper error handling and repair."""
+    """Download file using Telethon (without chunk_size parameter)."""
     if telethon_client is None:
         return False
     try:
-        # دانلود با chunk_size 1 مگابایت
-        await telethon_client.download_media(file_id, file=save_path, chunk_size=1024*1024)
-        
-        # بررسی صحت فایل
+        await telethon_client.download_media(file_id, file=save_path)
         if await check_video_file(save_path):
             return True
-        
-        # ترمیم فایل
         logger.info("File seems corrupted, attempting repair...")
         repaired_path = save_path + ".repaired.mp4"
         if await repair_video_file(save_path, repaired_path):
             os.replace(repaired_path, save_path)
             return True
-        
         return False
     except Exception as e:
         logger.error(f"Telethon download error: {e}")
@@ -1103,7 +1084,6 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
         except Exception as e:
             safe_unlink(tmp_path)
             logger.exception(f"Telethon download error: {e}")
-            # اگر فایل کوچک است، به روش بعدی برویم
             if file_size <= MAX_VIDEO_BYTES:
                 logger.warning("Falling back to Bot API for small file.")
             else:
