@@ -47,7 +47,7 @@ STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL", "-1003890591020"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip()
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -985,7 +985,13 @@ async def on_shutdown(bot: Bot) -> None:
 async def init_app() -> web.Application:
     global db_pool
 
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=1,
+        statement_cache_size=0,
+        command_timeout=60,
+    )
     await init_db(db_pool)
 
     bot = Bot(
