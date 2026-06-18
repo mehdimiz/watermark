@@ -47,7 +47,7 @@ STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL", "-1003890591020"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip()
-WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -568,8 +568,12 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             await message.answer("Admin panel", reply_markup=admin_keyboard())
             return
 
-        settings = await get_settings(db_pool)
-        has_wm = bool(settings.get("watermark_png"))
+        try:
+            settings = await get_settings(db_pool)
+            has_wm = bool(settings.get("watermark_png"))
+        except Exception as e:
+            logger.exception("Admin settings load failed: %s", e)
+            has_wm = False
         text = (
             "👋 <b>Admin panel</b>\n\n"
             f"Watermark: <b>{'saved' if has_wm else 'not set'}</b>\n"
@@ -635,8 +639,12 @@ async def cb_info(call: CallbackQuery) -> None:
     if not call.from_user or not is_admin(call.from_user.id):
         await call.answer("Not allowed", show_alert=True)
         return
-    settings = await get_settings(db_pool)
-    has_wm = bool(settings.get("watermark_png"))
+    try:
+        settings = await get_settings(db_pool)
+        has_wm = bool(settings.get("watermark_png"))
+    except Exception as e:
+        logger.exception("Settings load failed: %s", e)
+        has_wm = False
     updated_at = settings.get("updated_at")
     text = (
         "<b>Current settings</b>\n\n"
@@ -985,13 +993,7 @@ async def on_shutdown(bot: Bot) -> None:
 async def init_app() -> web.Application:
     global db_pool
 
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=1,
-        statement_cache_size=0,
-        command_timeout=60,
-    )
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db(db_pool)
 
     bot = Bot(
