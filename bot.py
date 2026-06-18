@@ -970,7 +970,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await deliver_user_video(message.bot, message.chat.id, payload)
 
 
-# ========== هندلر لینک تلگرام ==========
+# ========== هندلر لینک تلگرام (رفع خطا) ==========
 @router.message(F.text & F.chat.type == "private")
 async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     """دریافت لینک تلگرام و پردازش ویدیو"""
@@ -1019,48 +1019,30 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
         tele_msg = await client.get_messages(entity, ids=msg_id)
         await client.disconnect()
         
-        if not tele_msg or not tele_msg.media:
-            await message.answer("❌ پیام مورد نظر پیدا نشد یا شامل رسانه نیست.")
+        if not tele_msg:
+            await message.answer("❌ پیام مورد نظر پیدا نشد.")
             return
         
-        # شبیه‌سازی یک پیام با ویدیو برای پردازش
-        # ساخت یک Message ساختگی با اطلاعات ویدیو
-        class FakeMessage:
-            def __init__(self, tele_msg, chat_id):
-                self.chat = type('obj', (object,), {'id': chat_id})()
-                self.from_user = message.from_user
-                self.message_id = tele_msg.id
-                self.date = tele_msg.date
-                
-                if tele_msg.video:
-                    self.video = type('obj', (object,), {
-                        'file_id': tele_msg.video.id,
-                        'file_name': getattr(tele_msg.video, 'file_name', 'video.mp4'),
-                        'file_size': getattr(tele_msg.video, 'size', 0),
-                        'duration': getattr(tele_msg.video, 'duration', 0),
-                        'mime_type': getattr(tele_msg.video, 'mime_type', 'video/mp4'),
-                    })()
-                elif tele_msg.document and tele_msg.document.mime_type and tele_msg.document.mime_type.startswith('video/'):
-                    self.document = type('obj', (object,), {
-                        'file_id': tele_msg.document.id,
-                        'file_name': getattr(tele_msg.document, 'file_name', 'video.mp4'),
-                        'file_size': getattr(tele_msg.document, 'size', 0),
-                        'mime_type': getattr(tele_msg.document, 'mime_type', 'video/mp4'),
-                    })()
-                else:
-                    await message.answer("❌ رسانه یافت نشد.")
-                    raise Exception("No media found")
+        # بررسی وجود رسانه و استخراج اطلاعات
+        file_id_obj = None
+        file_name = "video_from_link.mp4"
+        file_size = 0
+        duration = 0
         
-        fake_msg = FakeMessage(tele_msg, entity.id)
+        if tele_msg.video:
+            file_id_obj = tele_msg.video.id
+            file_name = getattr(tele_msg.video, 'file_name', 'video_from_link.mp4')
+            file_size = getattr(tele_msg.video, 'size', 0)
+            duration = getattr(tele_msg.video, 'duration', 0)
+        elif tele_msg.document and tele_msg.document.mime_type and tele_msg.document.mime_type.startswith('video/'):
+            file_id_obj = tele_msg.document.id
+            file_name = getattr(tele_msg.document, 'file_name', 'video_from_link.mp4')
+            file_size = getattr(tele_msg.document, 'size', 0)
+            duration = getattr(tele_msg.document, 'duration', 0)
         
-        # دانلود ویدیو با استفاده از file_id
-        file_id_obj = getattr(fake_msg, 'video', getattr(fake_msg, 'document', None))
         if not file_id_obj:
-            await message.answer("❌ رسانه یافت نشد.")
+            await message.answer("❌ پیام مورد نظر شامل ویدیو یا فایل ویدیویی نیست.")
             return
-        
-        file_id_str = file_id_obj.file_id
-        file_name = file_id_obj.file_name or "video_from_link.mp4"
         
         # دانلود با Telethon
         suffix = Path(file_name).suffix or ".mp4"
@@ -1078,7 +1060,8 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             await message.answer(f"❌ اکانت یوزربات به کانال ذخیره‌سازی دسترسی ندارد.\nلطفاً آن را به کانال اضافه کنید.\nکانال ID: {STORAGE_CHANNEL}")
             return
         
-        await client2.download_media(file_id_str, file=tmp_path)
+        # دانلود
+        await client2.download_media(tele_msg, file=tmp_path)
         await client2.disconnect()
         
         if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
