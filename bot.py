@@ -1050,7 +1050,7 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
         filename = message.document.file_name or "video.mp4"
         file_size = message.document.file_size or 0
 
-    # If Telethon is available, use it (no size limit)
+    # اگر Telethon در دسترس است، از آن استفاده کن (بدون محدودیت حجم)
     if telethon_client is not None:
         suffix = Path(filename).suffix or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -1058,20 +1058,41 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
 
         logger.info(f"Downloading {filename} ({file_size} bytes) with Telethon...")
         try:
-            success = await download_file_with_telethon(file_id, tmp_path)
-            if success:
+            await telethon_client.download_media(file_id, file=tmp_path)
+            # بررسی صحت فایل
+            if await check_video_file(tmp_path):
                 logger.info("Download with Telethon successful.")
                 return tmp_path, filename, file_size
             else:
-                logger.warning("Telethon download failed, falling back to Bot API.")
+                # تلاش برای ترمیم
+                repaired_path = tmp_path + ".repaired.mp4"
+                if await repair_video_file(tmp_path, repaired_path):
+                    os.replace(repaired_path, tmp_path)
+                    logger.info("File repaired successfully.")
+                    return tmp_path, filename, file_size
+                else:
+                    safe_unlink(tmp_path)
+                    raise ValueError(
+                        "⚠️ فایل دانلود شده خراب است و قابل ترمیم نیست.\n"
+                        "لطفاً فایل را دوباره ارسال کنید یا از فرمت دیگری استفاده کنید."
+                    )
         except Exception as e:
-            logger.exception(f"Telethon download error: {e}, falling back to Bot API.")
-        safe_unlink(tmp_path)
+            safe_unlink(tmp_path)
+            logger.exception(f"Telethon download error: {e}")
+            # اگر Telethon خطا داد، به Bot API برگرد (فقط برای فایل‌های کوچک)
+            if file_size <= MAX_VIDEO_BYTES:
+                logger.warning("Falling back to Bot API for small file.")
+            else:
+                raise ValueError(f"❌ خطا در دانلود با Telethon: {str(e)}")
 
-    # Fallback: Bot API
-    if file_size and file_size > MAX_VIDEO_BYTES:
-        raise ValueError("⚠️ حجم فایل بیش از حد مجاز (۲۰ مگابایت) است. لطفاً فایل را با حجم کمتر ارسال کنید.")
+    # Fallback: فقط برای فایل‌های کوچک‌تر از ۲۰ مگابایت
+    if file_size > MAX_VIDEO_BYTES:
+        raise ValueError(
+            "⚠️ حجم فایل بیش از حد مجاز (۲۰ مگابایت) است.\n"
+            "Telethon در دسترس نیست یا خطا دارد. لطفاً فایل را با حجم کمتر ارسال کنید."
+        )
 
+    # دانلود با Bot API (فقط برای فایل‌های کوچک)
     try:
         file = await message.bot.get_file(file_id)
     except TelegramBadRequest as exc:
