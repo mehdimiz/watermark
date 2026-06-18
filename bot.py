@@ -34,10 +34,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# Telethon for large file downloads
+# Telethon for large file downloads and login
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import RPCError, ChatAdminRequiredError, ChannelPrivateError
+from telethon.errors import RPCError, ChatAdminRequiredError, ChannelPrivateError, SessionPasswordNeededError
 from telethon.tl.functions.messages import GetMessagesRequest
 
 try:
@@ -58,7 +58,8 @@ WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Telethon credentials
+# Telethon credentials (for userbot session)
+# These are the main credentials for the userbot that downloads files
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "").strip()
@@ -96,7 +97,7 @@ db_pool: Optional[asyncpg.Pool] = None
 BOT_USERNAME: Optional[str] = BOT_USERNAME_ENV or None
 PROCESS_LOCK = asyncio.Lock()
 
-# Telethon client instance
+# Telethon client instance (the userbot for downloading)
 telethon_client: Optional[TelegramClient] = None
 
 
@@ -124,6 +125,15 @@ class WatermarkState(StatesGroup):
 
 class JoinState(StatesGroup):
     waiting_for_links = State()
+
+
+# ========== Login States for 2FA ==========
+class LoginState(StatesGroup):
+    waiting_for_api_id = State()
+    waiting_for_api_hash = State()
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_password = State()  # برای رمز دو مرحله‌ای
 
 
 # -----------------------------------------------------------------------------
@@ -434,7 +444,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
             """
         )
         
-        # User data table (for link feature)
+        # User data table (for link feature and login)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS user_data (
@@ -827,6 +837,111 @@ async def ensure_bot_username(bot: Bot) -> str:
     return BOT_USERNAME
 
 
+# ========== لاگین با پشتیبانی از رمز دو مرحله‌ای ==========
+@router.callback_query(F.data == "login")
+async def cmd_login(call: CallbackQuery, state: FSMContext) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await state.set_state(LoginState.waiting_for_api_id)
+    await call.message.answer("🔑 لطفاً `api_id` خود را وارد کنید:\n(از my.telegram.org)")
+    await call.answer()
+
+
+@router.message(LoginState.waiting_for_api_id)
+async def login_api_id(message: Message, state: FSMContext) -> None:
+    try:
+        api_id = int(message.text.strip())
+        await state.update_data(api_id=api_id)
+        await state.set_state(LoginState.waiting_for_api_hash)
+        await message.answer("🔑 لطفاً `api_hash` خود را وارد کنید:")
+    except ValueError:
+        await message.answer("❌ api_id باید یک عدد باشد. دوباره وارد کنید:")
+
+
+@router.message(LoginState.waiting_for_api_hash)
+async def login_api_hash(message: Message, state: FSMContext) -> None:
+    api_hash = message.text.strip()
+    await state.update_data(api_hash=api_hash)
+    await state.set_state(LoginState.waiting_for_phone)
+    await message.answer("📞 لطفاً شماره تلفن خود را با کد کشور وارد کنید:\nمثال: `+989123456789`")
+
+
+@router.message(LoginState.waiting_for_phone)
+async def login_phone(message: Message, state: FSMContext) -> None:
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    data = await state.get_data()
+    client = TelegramClient(StringSession(), data['api_id'], data['api_hash'])
+    await client.connect()
+    try:
+        await client.send_code_request(phone)
+        await state.update_data(temp_client=client)
+        await state.set_state(LoginState.waiting_for_code)
+        await message.answer("✅ کد تأیید به تلگرام شما ارسال شد.\nلطفاً کد ۵ رقمی را وارد کنید:")
+    except Exception as e:
+        await message.answer(f"❌ خطا: {e}")
+
+
+@router.message(LoginState.waiting_for_code)
+async def login_code(message: Message, state: FSMContext) -> None:
+    code = message.text.strip()
+    data = await state.get_data()
+    client = data.get('temp_client')
+    if not client:
+        await message.answer("❌ نشست منقضی شد. دوباره /login را بزنید.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(data['phone'], code)
+        session_string = client.session.save()
+        await client.disconnect()
+        # Save session to database
+        user_id = message.from_user.id
+        await save_user_data(
+            user_id,
+            api_id=data['api_id'],
+            api_hash=data['api_hash'],
+            session_string=session_string
+        )
+        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
+        await state.clear()
+        # Show admin panel
+        await cmd_start(message, state)  # Reuse start
+    except SessionPasswordNeededError:
+        await state.set_state(LoginState.waiting_for_password)
+        await message.answer("🔐 حساب شما رمز دو مرحله‌ای دارد.\nلطفاً رمز خود را وارد کنید:")
+    except Exception as e:
+        await message.answer(f"❌ خطا: {e}")
+
+
+@router.message(LoginState.waiting_for_password)
+async def login_password(message: Message, state: FSMContext) -> None:
+    password = message.text.strip()
+    data = await state.get_data()
+    client = data.get('temp_client')
+    if not client:
+        await message.answer("❌ نشست منقضی شد. دوباره /login را بزنید.")
+        await state.clear()
+        return
+    try:
+        await client.sign_in(password=password)
+        session_string = client.session.save()
+        await client.disconnect()
+        user_id = message.from_user.id
+        await save_user_data(
+            user_id,
+            api_id=data['api_id'],
+            api_hash=data['api_hash'],
+            session_string=session_string
+        )
+        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
+        await state.clear()
+        await cmd_start(message, state)
+    except Exception as e:
+        await message.answer(f"❌ رمز اشتباه است: {e}")
+
+
 # -----------------------------------------------------------------------------
 # Telethon download helper with detailed logging
 # -----------------------------------------------------------------------------
@@ -1015,6 +1130,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         if payload:
             await message.answer("پنل ادمین", reply_markup=admin_keyboard())
             return
+        # بررسی لاگین
+        data = await get_user_data(message.from_user.id)
+        is_logged_in = data and data.get('session_string')
+        login_status = "✅ لاگین هستید" if is_logged_in else "❌ لاگین نیستید"
         try:
             settings = await get_settings(db_pool)
             has_wm = bool(settings.get("watermark_png"))
@@ -1022,8 +1141,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             has_wm = False
         text = (
             "👋 <b>پنل ادمین</b>\n\n"
-            f"واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
-            "برای تنظیم واترمارک، جوین اجباری و پردازش ویدیو از دکمه‌های زیر استفاده کنید."
+            f"🟢 واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
+            f"🔐 وضعیت لاگین: <b>{login_status}</b>\n\n"
+            "برای تنظیم واترمارک، جوین اجباری و پردازش ویدیو از دکمه‌های زیر استفاده کنید.\n"
+            "برای استفاده از قابلیت لینک، ابتدا لاگین کنید."
         )
         await message.answer(text, reply_markup=admin_keyboard())
         return
@@ -1065,8 +1186,19 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     try:
         # دریافت اطلاعات اکانت یوزربات از دیتابیس
         data = await get_user_data(message.from_user.id)
+        
+        # اگر کاربر لاگین نکرده باشد
         if not data or not data.get('session_string'):
-            await message.answer("❌ ابتدا لاگین کنید.")
+            await message.answer(
+                "❌ **ابتدا لاگین کنید.**\n\n"
+                "برای استفاده از قابلیت لینک، باید در ربات لاگین کنید:\n"
+                "1️⃣ روی /start کلیک کنید.\n"
+                "2️⃣ روی دکمه «لاگین» بزنید.\n"
+                "3️⃣ api_id و api_hash و شماره تلفن خود را وارد کنید.\n"
+                "4️⃣ کد تأیید را وارد کنید.\n\n"
+                "پس از لاگین موفق، دوباره لینک را ارسال کنید.",
+                parse_mode="Markdown"
+            )
             return
         
         # اتصال با Telethon
@@ -1124,7 +1256,11 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             await client2.get_entity(STORAGE_CHANNEL)
         except Exception as e:
             await client2.disconnect()
-            await message.answer(f"❌ اکانت یوزربات به کانال ذخیره‌سازی دسترسی ندارد.\nلطفاً آن را به کانال اضافه کنید.\nکانال ID: {STORAGE_CHANNEL}")
+            await message.answer(
+                f"❌ اکانت یوزربات به کانال ذخیره‌سازی دسترسی ندارد.\n"
+                f"لطفاً آن را به کانال اضافه کنید.\n"
+                f"کانال ID: {STORAGE_CHANNEL}"
+            )
             return
         
         # دانلود
