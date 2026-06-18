@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 # Telethon for large file downloads and login
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import RPCError, ChatAdminRequiredError, ChannelPrivateError, SessionPasswordNeededError
+from telethon.errors import RPCError, ChatAdminRequiredError, ChannelPrivateError, SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 from telethon.tl.functions.messages import GetMessagesRequest
 
 try:
@@ -474,13 +474,15 @@ async def get_user_data(user_id: int) -> Optional[dict]:
 async def save_user_data(user_id: int, **kwargs) -> None:
     if db_pool is None:
         return
+    if not kwargs:
+        return
     async with db_pool.acquire() as conn:
-        existing = await get_user_data(user_id)
+        existing = await conn.fetchrow("SELECT 1 FROM user_data WHERE user_id = $1", user_id)
         if existing:
             fields = []
             values = []
             for key, val in kwargs.items():
-                fields.append(f"{key} = ${len(values)+1}")
+                fields.append(f"{key} = ${len(values) + 1}")
                 values.append(val)
             values.append(user_id)
             query = f"UPDATE user_data SET {', '.join(fields)} WHERE user_id = ${len(values)}"
@@ -860,8 +862,8 @@ async def login_phone(message: Message, state: FSMContext) -> None:
     client = TelegramClient(StringSession(), data['api_id'], data['api_hash'])
     await client.connect()
     try:
-        await client.send_code_request(phone)
-        await state.update_data(temp_client=client)
+        sent_code = await client.send_code_request(phone)
+        await state.update_data(temp_client=client, phone_code_hash=getattr(sent_code, 'phone_code_hash', None))
         await state.set_state(LoginState.waiting_for_code)
         await message.answer("✅ کد تأیید به تلگرام شما ارسال شد.\nلطفاً کد ۵ رقمی را وارد کنید (فقط اعداد):")
     except Exception as e:
@@ -871,13 +873,17 @@ async def login_phone(message: Message, state: FSMContext) -> None:
 
 @router.message(LoginState.waiting_for_code)
 async def login_code(message: Message, state: FSMContext) -> None:
-    code = message.text.strip()
+    code = re.sub(r"\D", "", (message.text or "")).strip()
     data = await state.get_data()
     client = data.get('temp_client')
     
     if not client:
         await message.answer("❌ نشست منقضی شد. دوباره /start را بزنید.")
         await state.clear()
+        return
+    
+    if len(code) < 5:
+        await message.answer("❌ کد نامعتبر است. فقط کد ۵ رقمی را بفرستید.")
         return
     
     # اطمینان از اتصال کلاینت (اگر قطع شده، دوباره وصل کن)
@@ -889,7 +895,11 @@ async def login_code(message: Message, state: FSMContext) -> None:
             return
     
     try:
-        await client.sign_in(data['phone'], code)
+        await client.sign_in(
+            phone=data['phone'],
+            code=code,
+            phone_code_hash=data.get('phone_code_hash')
+        )
         session_string = client.session.save()
         await client.disconnect()
         
@@ -900,13 +910,17 @@ async def login_code(message: Message, state: FSMContext) -> None:
             api_hash=data['api_hash'],
             session_string=session_string
         )
-        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await state.clear()
+        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await cmd_start(message, state)
         
     except SessionPasswordNeededError:
         await state.set_state(LoginState.waiting_for_password)
         await message.answer("🔐 حساب شما رمز دو مرحله‌ای دارد.\nلطفاً رمز خود را وارد کنید:")
+    except PhoneCodeInvalidError:
+        await message.answer("❌ کد تأیید اشتباه است. دوباره امتحان کنید.")
+    except PhoneCodeExpiredError:
+        await message.answer("❌ کد منقضی شده است. دوباره درخواست کد بدهید.")
     except Exception as e:
         if "disconnected" in str(e).lower():
             await message.answer("❌ اتصال قطع شد. لطفاً دوباره تلاش کنید (دوباره /start و لاگین).")
@@ -943,8 +957,8 @@ async def login_password(message: Message, state: FSMContext) -> None:
             api_hash=data['api_hash'],
             session_string=session_string
         )
-        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await state.clear()
+        await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await cmd_start(message, state)
     except Exception as e:
         if "disconnected" in str(e).lower():
@@ -957,24 +971,47 @@ async def login_password(message: Message, state: FSMContext) -> None:
 # Telethon download helper with detailed logging
 # -----------------------------------------------------------------------------
 
-async def download_file_with_telethon(file_id: str, save_path: str, storage_channel: int) -> tuple[bool, str]:
+async def download_file_with_telethon_from_message(
+    source_message: Message,
+    save_path: str,
+    storage_channel: int,
+) -> tuple[bool, str]:
     if telethon_client is None:
         return False, "Telethon client not available"
     
+    copied_message_id: int | None = None
     try:
-        logger.info(f"Telethon: Starting download of file_id={file_id}")
+        logger.info("Telethon: Copying source message to storage channel...")
         
         try:
-            chat = await telethon_client.get_entity(storage_channel)
-            logger.info(f"Telethon: Successfully accessed channel {storage_channel}")
+            copied = await source_message.bot.copy_message(
+                chat_id=storage_channel,
+                from_chat_id=source_message.chat.id,
+                message_id=source_message.message_id,
+            )
+        except TelegramBadRequest as e:
+            logger.error(f"Telethon: Bot copy_message failed: {e}")
+            return False, f"کپی پیام به کانال ذخیره‌سازی ناموفق بود: {e}"
+        except TelegramForbiddenError as e:
+            logger.error(f"Telethon: Bot is not allowed to write to storage channel: {e}")
+            return False, f"ربات به کانال ذخیره‌سازی دسترسی نوشتن ندارد: {e}"
+        
+        copied_message_id = copied.message_id if hasattr(copied, 'message_id') else int(copied)
+        logger.info(f"Telethon: Message copied to storage channel as message_id={copied_message_id}")
+
+        try:
+            tele_msg = await telethon_client.get_messages(storage_channel, ids=copied_message_id)
         except ChannelPrivateError as e:
-            logger.error(f"Telethon: Cannot access channel {storage_channel} - {e}")
+            logger.error(f"Telethon: Cannot access storage channel {storage_channel} - {e}")
             return False, f"اکانت یوزربات به کانال ذخیره‌سازی دسترسی ندارد. لطفاً اکانت را به کانال اضافه کنید.\nخطا: {e}"
         except Exception as e:
-            logger.error(f"Telethon: Error accessing channel: {e}")
+            logger.error(f"Telethon: Error accessing storage channel: {e}")
             return False, f"خطا در دسترسی به کانال: {e}"
-        
-        await telethon_client.download_media(file_id, file=save_path)
+
+        if not tele_msg:
+            return False, "پیام کپی‌شده در کانال ذخیره‌سازی پیدا نشد"
+
+        await telethon_client.download_media(tele_msg, file=save_path)
         
         if not os.path.exists(save_path):
             return False, "فایل دانلود نشد (مسیر وجود ندارد)"
@@ -1007,6 +1044,12 @@ async def download_file_with_telethon(file_id: str, save_path: str, storage_chan
     except Exception as e:
         logger.error(f"Telethon unexpected error: {e}")
         return False, f"خطا: {e}"
+    finally:
+        if copied_message_id is not None:
+            try:
+                await telethon_client.delete_messages(storage_channel, copied_message_id)
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -1063,27 +1106,27 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
                 logger.info("aiohttp download successful.")
                 return tmp_path, filename, file_size
             else:
-                safe_unlink(tmp_path)
                 logger.warning(f"aiohttp download file invalid: {err_msg}")
                 repaired_path = tmp_path + ".repaired.mp4"
                 success, repair_err = await repair_video_file(tmp_path, repaired_path)
                 if success:
                     os.replace(repaired_path, tmp_path)
                     return tmp_path, filename, file_size
-                raise ValueError(f"فایل دانلود شده خراب است: {err_msg}")
-                
+                safe_unlink(tmp_path)
+                logger.warning(f"aiohttp repair failed: {repair_err}")
+                # Fall through to Telethon route below.
         except Exception as e:
             logger.error(f"aiohttp download error: {e}")
-            pass
+            # Fall through to Telethon route below.
 
     if telethon_client is not None:
-        logger.info(f"Method 2: Telethon download")
+        logger.info("Method 2: Telethon download via storage channel copy")
         suffix = Path(filename).suffix or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
 
         logger.info(f"Downloading with Telethon to {tmp_path}...")
-        success, error_msg = await download_file_with_telethon(file_id, tmp_path, STORAGE_CHANNEL)
+        success, error_msg = await download_file_with_telethon_from_message(message, tmp_path, STORAGE_CHANNEL)
         
         if success:
             logger.info("Telethon download successful.")
@@ -1092,10 +1135,10 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
             safe_unlink(tmp_path)
             logger.error(f"Telethon download failed: {error_msg}")
             
-            if "دسترسی ندارد" in error_msg or "عضو نیست" in error_msg:
+            if "دسترسی ندارد" in error_msg or "عضو نیست" in error_msg or "دسترسی نوشتن ندارد" in error_msg:
                 raise ValueError(
                     f"❌ {error_msg}\n\n"
-                    "⚠️ راه‌حل: اکانت یوزربات را به کانال ذخیره‌سازی اضافه کنید.\n"
+                    "⚠️ راه‌حل: اکانت یوزربات را به کانال ذخیره‌سازی اضافه کنید و مطمئن شوید ربات هم اجازه نوشتن در آن را دارد.\n"
                     f"کانال ID: {STORAGE_CHANNEL}\n"
                     "سپس دوباره امتحان کنید."
                 )
