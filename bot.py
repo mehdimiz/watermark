@@ -822,7 +822,7 @@ async def ensure_bot_username(bot: Bot) -> str:
     return BOT_USERNAME
 
 
-# ========== لاگین با پشتیبانی از رمز دو مرحله‌ای ==========
+# ========== لاگین با پشتیبانی از رمز دو مرحله‌ای و مدیریت اتصال ==========
 @router.callback_query(F.data == "login")
 async def cmd_login(call: CallbackQuery, state: FSMContext) -> None:
     if not call.from_user or not is_admin(call.from_user.id):
@@ -863,9 +863,10 @@ async def login_phone(message: Message, state: FSMContext) -> None:
         await client.send_code_request(phone)
         await state.update_data(temp_client=client)
         await state.set_state(LoginState.waiting_for_code)
-        await message.answer("✅ کد تأیید به تلگرام شما ارسال شد.\nلطفاً کد ۵ رقمی را وارد کنید:")
+        await message.answer("✅ کد تأیید به تلگرام شما ارسال شد.\nلطفاً کد ۵ رقمی را وارد کنید (فقط اعداد):")
     except Exception as e:
-        await message.answer(f"❌ خطا: {e}")
+        await client.disconnect()
+        await message.answer(f"❌ خطا در ارسال کد: {e}")
 
 
 @router.message(LoginState.waiting_for_code)
@@ -873,14 +874,25 @@ async def login_code(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
     data = await state.get_data()
     client = data.get('temp_client')
+    
     if not client:
-        await message.answer("❌ نشست منقضی شد. دوباره /login را بزنید.")
+        await message.answer("❌ نشست منقضی شد. دوباره /start را بزنید.")
         await state.clear()
         return
+    
+    # اطمینان از اتصال کلاینت (اگر قطع شده، دوباره وصل کن)
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            await message.answer(f"❌ خطا در اتصال مجدد: {e}")
+            return
+    
     try:
         await client.sign_in(data['phone'], code)
         session_string = client.session.save()
         await client.disconnect()
+        
         user_id = message.from_user.id
         await save_user_data(
             user_id,
@@ -891,11 +903,15 @@ async def login_code(message: Message, state: FSMContext) -> None:
         await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await state.clear()
         await cmd_start(message, state)
+        
     except SessionPasswordNeededError:
         await state.set_state(LoginState.waiting_for_password)
         await message.answer("🔐 حساب شما رمز دو مرحله‌ای دارد.\nلطفاً رمز خود را وارد کنید:")
     except Exception as e:
-        await message.answer(f"❌ خطا: {e}")
+        if "disconnected" in str(e).lower():
+            await message.answer("❌ اتصال قطع شد. لطفاً دوباره تلاش کنید (دوباره /start و لاگین).")
+        else:
+            await message.answer(f"❌ خطا: {e}")
 
 
 @router.message(LoginState.waiting_for_password)
@@ -903,10 +919,19 @@ async def login_password(message: Message, state: FSMContext) -> None:
     password = message.text.strip()
     data = await state.get_data()
     client = data.get('temp_client')
+    
     if not client:
-        await message.answer("❌ نشست منقضی شد. دوباره /login را بزنید.")
+        await message.answer("❌ نشست منقضی شد. دوباره /start را بزنید.")
         await state.clear()
         return
+    
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            await message.answer(f"❌ خطا در اتصال مجدد: {e}")
+            return
+    
     try:
         await client.sign_in(password=password)
         session_string = client.session.save()
@@ -922,7 +947,10 @@ async def login_password(message: Message, state: FSMContext) -> None:
         await state.clear()
         await cmd_start(message, state)
     except Exception as e:
-        await message.answer(f"❌ رمز اشتباه است: {e}")
+        if "disconnected" in str(e).lower():
+            await message.answer("❌ اتصال قطع شد. لطفاً دوباره تلاش کنید.")
+        else:
+            await message.answer(f"❌ رمز اشتباه است یا خطا: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -1735,6 +1763,7 @@ async def on_startup(bot: Bot) -> None:
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
 
+    # Start Telethon client if credentials are provided
     if API_ID and API_HASH and USER_SESSION_STRING:
         telethon_client = TelegramClient(
             StringSession(USER_SESSION_STRING),
@@ -1752,12 +1781,30 @@ async def on_startup(bot: Bot) -> None:
     else:
         logger.warning("API_ID, API_HASH, or USER_SESSION_STRING not set. Large file downloads will not work.")
 
-    if WEBHOOK_BASE_URL:
-        webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
-        await bot.set_webhook(webhook_url, drop_pending_updates=True)
-        logger.info("Webhook set to %s", webhook_url)
+    # ========== تنظیم خودکار وب‌هوک ==========
+    # اولویت 1: RENDER_EXTERNAL_URL (متغیر خودکار Render)
+    webhook_base = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not webhook_base:
+        # اولویت 2: WEBHOOK_BASE_URL (تنظیم دستی توسط کاربر)
+        webhook_base = WEBHOOK_BASE_URL
+
+    if webhook_base:
+        webhook_url = webhook_base.rstrip("/") + WEBHOOK_PATH
+        try:
+            await bot.set_webhook(webhook_url, drop_pending_updates=True)
+            logger.info(f"✅ Webhook successfully set to: {webhook_url}")
+        except Exception as e:
+            logger.error(f"❌ Failed to set webhook: {e}")
+            logger.warning("⚠️ Please set webhook manually using:\n"
+                           f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
     else:
-        logger.warning("WEBHOOK_BASE_URL is empty; webhook not registered.")
+        logger.warning(
+            "⚠️ Neither RENDER_EXTERNAL_URL nor WEBHOOK_BASE_URL is set.\n"
+            "Webhook will not be registered automatically.\n"
+            "Please set WEBHOOK_BASE_URL environment variable or use polling.\n"
+            f"To set webhook manually, use:\n"
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url=YOUR_WEBHOOK_URL"
+        )
 
 
 async def on_shutdown(bot: Bot) -> None:
