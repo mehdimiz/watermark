@@ -395,6 +395,9 @@ def resize_watermark_for_video(
 # Database helpers
 # -----------------------------------------------------------------------------
 
+async def get_conn():
+    return await asyncpg.connect(DATABASE_URL)
+
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
@@ -430,7 +433,78 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
             """
         )
+        # جدول user_data برای ذخیره اطلاعات کاربران (برای قابلیت لینک)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_data (
+                user_id BIGINT PRIMARY KEY,
+                api_id INTEGER,
+                api_hash TEXT,
+                session_string TEXT,
+                target_chat_id BIGINT,
+                target_chat_title TEXT,
+                auto_video_duration INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        # اضافه کردن ستون‌های reply و auto_video اگر وجود ندارند
+        try:
+            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_msg_id INTEGER DEFAULT NULL;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_active BOOLEAN DEFAULT FALSE;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_chat_id BIGINT DEFAULT NULL;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS auto_video_enabled BOOLEAN DEFAULT FALSE;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS auto_video_path TEXT DEFAULT NULL;")
+        except Exception:
+            pass
 
+
+async def get_user_data(user_id: int) -> Optional[dict]:
+    """دریافت اطلاعات کاربر از دیتابیس"""
+    async with get_conn() as conn:
+        row = await conn.fetchrow('SELECT * FROM user_data WHERE user_id = $1', user_id)
+        return dict(row) if row else None
+
+
+async def save_user_data(user_id: int, **kwargs) -> None:
+    """ذخیره یا به‌روزرسانی اطلاعات کاربر"""
+    async with get_conn() as conn:
+        # دریافت اطلاعات موجود
+        existing = await get_user_data(user_id)
+        if existing:
+            # به‌روزرسانی
+            fields = []
+            values = []
+            for key, val in kwargs.items():
+                fields.append(f"{key} = ${len(values)+1}")
+                values.append(val)
+            values.append(user_id)
+            query = f"UPDATE user_data SET {', '.join(fields)} WHERE user_id = ${len(values)}"
+            await conn.execute(query, *values)
+        else:
+            # درج جدید
+            columns = list(kwargs.keys()) + ['user_id']
+            placeholders = ', '.join([f"${i+1}" for i in range(len(columns))])
+            values = list(kwargs.values()) + [user_id]
+            query = f"INSERT INTO user_data ({', '.join(columns)}) VALUES ({placeholders})"
+            await conn.execute(query, *values)
+
+
+# -----------------------------------------------------------------------------
+# UI helpers
+# -----------------------------------------------------------------------------
 
 async def get_settings(pool: asyncpg.Pool) -> dict[str, Any]:
     async with pool.acquire() as conn:
@@ -493,7 +567,7 @@ async def get_video_mapping(pool: asyncpg.Pool, token: str) -> dict[str, Any] | 
 
 
 # -----------------------------------------------------------------------------
-# UI helpers
+# UI helpers (join links)
 # -----------------------------------------------------------------------------
 
 async def get_join_links(pool: asyncpg.Pool) -> list[dict[str, Any]]:
@@ -970,7 +1044,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await deliver_user_video(message.bot, message.chat.id, payload)
 
 
-# ========== هندلر لینک تلگرام (رفع خطا) ==========
+# ========== هندلر لینک تلگرام (با دسترسی به get_user_data) ==========
 @router.message(F.text & F.chat.type == "private")
 async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     """دریافت لینک تلگرام و پردازش ویدیو"""
@@ -996,9 +1070,9 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     await message.answer("⏳ در حال دریافت ویدیو از لینک...")
     
     try:
-        # دریافت اطلاعات اکانت یوزربات
+        # دریافت اطلاعات اکانت یوزربات از دیتابیس
         data = await get_user_data(message.from_user.id)
-        if not data or not data['session_string']:
+        if not data or not data.get('session_string'):
             await message.answer("❌ ابتدا لاگین کنید.")
             return
         
@@ -1581,7 +1655,7 @@ async def help_cmd(message: Message) -> None:
 # -----------------------------------------------------------------------------
 
 async def on_startup(bot: Bot) -> None:
-    global telethon_client
+    global telethon_client, db_pool
 
     await ensure_bot_username(bot)
     if db_pool is None:
