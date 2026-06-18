@@ -125,7 +125,7 @@ class JoinState(StatesGroup):
 
 
 # -----------------------------------------------------------------------------
-# FFmpeg helpers
+# FFmpeg helpers (with repair capability)
 # -----------------------------------------------------------------------------
 
 def _which_ffmpeg() -> str:
@@ -153,7 +153,40 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
 
 
+async def check_video_file(file_path: str) -> bool:
+    """Check if the video file is valid and has metadata."""
+    cmd = [FFMPEG, "-v", "error", "-i", file_path, "-f", "null", "-"]
+    code, _, err = await run_cmd(cmd)
+    return code == 0
+
+
+async def repair_video_file(input_path: str, output_path: str) -> bool:
+    """Attempt to repair a video file by remuxing with faststart."""
+    cmd = [
+        FFMPEG, "-y",
+        "-i", input_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    code, _, err = await run_cmd(cmd)
+    if code == 0 and Path(output_path).exists():
+        return await check_video_file(output_path)
+    return False
+
+
 async def extract_frame(video_path: str, out_path: str, at_seconds: float = 1.0) -> None:
+    # First, check if the video is valid
+    if not await check_video_file(video_path):
+        # Try to repair
+        temp_dir = Path(video_path).parent / "repair"
+        temp_dir.mkdir(exist_ok=True)
+        repaired_path = str(temp_dir / "repaired.mp4")
+        if await repair_video_file(video_path, repaired_path):
+            video_path = repaired_path
+        else:
+            raise RuntimeError("ویدیو خراب است یا فرمت آن پشتیبانی نمی‌شود. لطفاً فایل را دوباره ارسال کنید.")
+
     cmd = [FFMPEG, "-y", "-ss", str(at_seconds), "-i", video_path, "-frames:v", "1", "-q:v", "2", out_path]
     code, _, err = await run_cmd(cmd)
     if code != 0:
@@ -167,6 +200,16 @@ async def render_video_with_watermark(
     selected_percent: int,
     frame_width: int,
 ) -> None:
+    # Also check input video before rendering
+    if not await check_video_file(input_path):
+        temp_dir = Path(input_path).parent / "repair"
+        temp_dir.mkdir(exist_ok=True)
+        repaired_path = str(temp_dir / "repaired.mp4")
+        if await repair_video_file(input_path, repaired_path):
+            input_path = repaired_path
+        else:
+            raise RuntimeError("ویدیو خراب است و قابل ترمیم نیست.")
+
     target_width = min(frame_width, OUTPUT_MAX_WIDTH)
     watermark_width = max(64, int(target_width * selected_percent / 100))
     margin = WATERMARK_MARGIN
@@ -406,6 +449,7 @@ async def get_video_mapping(pool: asyncpg.Pool, token: str) -> dict[str, Any] | 
 
 # -----------------------------------------------------------------------------
 # UI helpers
+# -----------------------------------------------------------------------------
 
 async def get_join_links(pool: asyncpg.Pool) -> list[dict[str, Any]]:
     async with pool.acquire() as conn:
@@ -676,14 +720,22 @@ async def ensure_bot_username(bot: Bot) -> str:
 # -----------------------------------------------------------------------------
 
 async def download_file_with_telethon(file_id: str, save_path: str) -> bool:
-    """Download file using Telethon (no size limit)."""
+    """Download file using Telethon and validate it."""
     if telethon_client is None:
         logger.error("Telethon client not available.")
         return False
     try:
-        # Telethon can download media by file_id
         await telethon_client.download_media(file_id, file=save_path)
-        return True
+        # Check if file is valid
+        if await check_video_file(save_path):
+            return True
+        else:
+            repaired_path = save_path + ".repaired.mp4"
+            if await repair_video_file(save_path, repaired_path):
+                shutil.move(repaired_path, save_path)
+                return True
+            logger.warning("Downloaded file is not a valid video.")
+            return False
     except RPCError as e:
         logger.error(f"Telethon download error: {e}")
         return False
@@ -693,7 +745,7 @@ async def download_file_with_telethon(file_id: str, save_path: str) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Admin handlers
+# Admin handlers (with video download)
 # -----------------------------------------------------------------------------
 
 @router.message(F.chat.type.in_({"group", "supergroup", "channel"}))
@@ -977,7 +1029,7 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Video handling for admin (with Telethon for large files)
+# Video handling
 # -----------------------------------------------------------------------------
 
 def _is_video_message(message: Message) -> bool:
@@ -1011,27 +1063,20 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
                 logger.info("Download with Telethon successful.")
                 return tmp_path, filename, file_size
             else:
-                logger.warning("Telethon download failed, falling back to Bot API download.")
+                logger.warning("Telethon download failed, falling back to Bot API.")
         except Exception as e:
             logger.exception(f"Telethon download error: {e}, falling back to Bot API.")
-        # If Telethon fails, fall through to Bot API method
         safe_unlink(tmp_path)
 
-    # Fallback: use Bot API (aiohttp) - this will fail for >20MB
+    # Fallback: Bot API
     if file_size and file_size > MAX_VIDEO_BYTES:
-        raise ValueError(
-            "⚠️ حجم فایل بیش از حد مجاز برای دانلود از طریق Bot API (۲۰ مگابایت) است.\n"
-            "Telethon در دسترس نیست یا خطا دارد. لطفاً فایل را با حجم کمتر ارسال کنید."
-        )
+        raise ValueError("⚠️ حجم فایل بیش از حد مجاز (۲۰ مگابایت) است. لطفاً فایل را با حجم کمتر ارسال کنید.")
 
     try:
         file = await message.bot.get_file(file_id)
     except TelegramBadRequest as exc:
         if "file is too big" in str(exc).lower():
-            raise ValueError(
-                "⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است و Telethon در دسترس نیست.\n"
-                "لطفاً API_ID, API_HASH, USER_SESSION_STRING را به درستی تنظیم کنید."
-            ) from exc
+            raise ValueError("⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است و Telethon در دسترس نیست.")
         raise ValueError(f"خطا در دریافت اطلاعات فایل: {exc}") from exc
 
     file_path = file.file_path
@@ -1271,7 +1316,7 @@ async def on_startup(bot: Bot) -> None:
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
 
-    # Start Telethon client if credentials and session are provided
+    # Start Telethon client if credentials are provided
     if API_ID and API_HASH and USER_SESSION_STRING:
         telethon_client = TelegramClient(
             StringSession(USER_SESSION_STRING),
@@ -1280,7 +1325,6 @@ async def on_startup(bot: Bot) -> None:
         )
         try:
             await telethon_client.start()
-            # Verify connection
             me = await telethon_client.get_me()
             logger.info(f"Telethon client started successfully as @{me.username}")
         except Exception as e:
