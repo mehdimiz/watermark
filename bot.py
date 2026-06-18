@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -12,8 +11,9 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
+import aiohttp
 import asyncpg
-from aiohttp import web, ClientTimeout
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
@@ -170,50 +170,6 @@ async def render_video_with_watermark(
     watermark_width = max(64, int(target_width * selected_percent / 100))
     margin = WATERMARK_MARGIN
 
-    # Strip metadata and compress a bit for Telegram delivery.
-    vf = (
-        f"scale={target_width}:-2,"
-        f"format=yuv420p"
-    )
-
-    # First scale the watermark itself to the selected size, then overlay.
-    # The watermark is pre-resized in Python for determinism and smaller command lines.
-    cmd = [
-        FFMPEG,
-        "-y",
-        "-i",
-        input_path,
-        "-i",
-        watermark_path,
-        "-map_metadata",
-        "-1",
-        "-map_chapters",
-        "-1",
-        "-vf",
-        vf,
-        "-filter_complex",
-        f"[1:v]scale={watermark_width}:-1[wm];[0:v][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        "-shortest",
-        output_path,
-    ]
-
-    # NOTE: We intentionally scale the base video and overlay a sized watermark.
-    # Some ffmpeg builds may not like both -vf and -filter_complex together.
-    # To keep compatibility, the actual command is constructed in a safer way below.
     cmd = [
         FFMPEG,
         "-y",
@@ -259,7 +215,6 @@ async def render_video_with_watermark(
 # -----------------------------------------------------------------------------
 
 def _load_font(size: int = 24) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    # PIL default font is used as fallback to avoid bundling extra assets.
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size=size)
     except Exception:
@@ -322,7 +277,6 @@ def build_preview_collage(
     watermark = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
     base_w, base_h = frame.size
 
-    # Use a fixed preview tile size for a clean 2x2 collage.
     tiles: list[Image.Image] = []
     labels = ["Small", "Medium", "Large", "XL"]
     for idx, percent in enumerate(PREVIEW_SIZES):
@@ -764,7 +718,14 @@ async def ensure_bot_username(bot: Bot) -> str:
 # Admin handlers
 # -----------------------------------------------------------------------------
 
-@router.message(CommandStart())
+# --- Ignore group messages completely ---
+@router.message(F.chat.type.in_({"group", "supergroup", "channel"}))
+async def ignore_groups(message: Message) -> None:
+    # Silently ignore all messages from groups/channels
+    return
+
+# --- Private chat handlers only ---
+@router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext) -> None:
     payload = ""
     if message.text and " " in message.text:
@@ -841,7 +802,6 @@ async def cb_join_check(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "join:add")
-
 async def cb_join_add(call: CallbackQuery, state: FSMContext) -> None:
     if not call.from_user or not is_admin(call.from_user.id):
         await call.answer("Not allowed", show_alert=True)
@@ -978,7 +938,6 @@ async def receive_join_links(message: Message, state: FSMContext) -> None:
     await message.answer(msg)
 
 
-
 @router.callback_query(F.data == "wm:set")
 async def cb_set_watermark(call: CallbackQuery, state: FSMContext) -> None:
     if not call.from_user or not is_admin(call.from_user.id):
@@ -1056,7 +1015,6 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
         await message.bot.download_file(file.file_path, destination=tmp)
 
     try:
-        # Validate PNG is readable.
         with open(tmp_path, "rb") as f:
             png_bytes = f.read()
         Image.open(BytesIO(png_bytes)).verify()
@@ -1083,7 +1041,10 @@ def _is_video_message(message: Message) -> bool:
 
 
 async def download_admin_video(message: Message) -> tuple[str, str, int]:
-    """Download the admin's video to a temp file. Returns (path, filename, bytes)."""
+    """
+    Download the admin's video using aiohttp with a large timeout.
+    Returns (temp_path, filename, file_size).
+    """
     if message.video:
         file_id = message.video.file_id
         filename = message.video.file_name or "video.mp4"
@@ -1104,17 +1065,29 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
             "لطفاً فایل را کمی کوچک‌تر یا به صورت فشرده‌تر ارسال کنید."
         ) from exc
 
+    file_path = file.file_path
+    if not file_path:
+        raise ValueError("Could not obtain file path from Telegram.")
+
+    # Prepare a temp file
     suffix = Path(filename).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
 
-    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-    timeout = ClientTimeout(total=None, sock_connect=60, sock_read=60)
-    async with message.bot.session.get(file_url, timeout=timeout) as resp:
-        resp.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                f.write(chunk)
+    # Download using aiohttp with a generous timeout
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    timeout = aiohttp.ClientTimeout(total=300, connect=60, sock_read=120)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                # Try to read error message from Telegram
+                error_text = await response.text()
+                raise ValueError(f"Download failed with status {response.status}: {error_text[:200]}")
+            # Stream to file
+            with open(tmp_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(8192):
+                    f.write(chunk)
 
     return tmp_path, filename, file_size
 
@@ -1231,7 +1204,6 @@ async def cb_choose_size(call: CallbackQuery) -> None:
 
     await call.answer(f"Selected {size_percent}%")
 
-    # Process in the background so the callback returns immediately.
     asyncio.create_task(process_job(call.bot, job_id))
 
 
@@ -1241,7 +1213,6 @@ async def process_job(bot: Bot, job_id: str) -> None:
         return
 
     async with PROCESS_LOCK:
-        # Re-check after waiting for the lock.
         job = JOBS.get(job_id)
         if not job:
             return
@@ -1261,7 +1232,6 @@ async def process_job(bot: Bot, job_id: str) -> None:
         output_path = str(temp_dir / "final.mp4")
 
         try:
-            # Resize the watermark PNG for this specific video.
             await asyncio.to_thread(
                 resize_watermark_for_video,
                 watermark_bytes,
@@ -1322,7 +1292,6 @@ def cleanup_job(job_id: str) -> None:
     safe_unlink(job.source_path)
     safe_unlink(job.frame_path)
     safe_unlink(job.preview_path)
-    # Remove the job temp directory if it still exists.
     try:
         temp_dir = Path(job.frame_path).parent
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1334,7 +1303,7 @@ def cleanup_job(job_id: str) -> None:
 # Fallback / admin help
 # -----------------------------------------------------------------------------
 
-@router.message(Command("help"))
+@router.message(Command("help"), F.chat.type == "private")
 async def help_cmd(message: Message) -> None:
     if is_admin(message.from_user.id):
         await message.answer(
@@ -1391,7 +1360,6 @@ async def on_shutdown(bot: Bot) -> None:
 async def init_app() -> web.Application:
     global db_pool
 
-    # Create the asyncpg pool on the same event loop that will serve webhook updates.
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1, statement_cache_size=0, command_timeout=60)
     await init_db(db_pool)
 
@@ -1411,7 +1379,6 @@ async def init_app() -> web.Application:
 
 
 def main() -> None:
-    # Let aiohttp own the event loop so asyncpg/Bot are created on the same loop.
     web.run_app(init_app(), host="0.0.0.0", port=PORT)
 
 
