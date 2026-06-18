@@ -33,9 +33,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# Pyrogram for downloading large files
-from pyrogram import Client as PyroClient
-from pyrogram.errors import RPCError
+# Telethon for large file downloads
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import RPCError
 
 try:
     import imageio_ffmpeg
@@ -55,15 +56,18 @@ WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-# Pyrogram credentials (required for large file downloads)
+# Telethon credentials
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
+USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "").strip()
 
 if not API_ID or not API_HASH:
-    logging.warning("API_ID and API_HASH are not set. Large file downloads (>20MB) will fail.")
+    logging.warning("API_ID and API_HASH are not set. Telethon will not work.")
+if not USER_SESSION_STRING:
+    logging.warning("USER_SESSION_STRING is not set. Large file downloads will fall back to Bot API.")
 
 MAX_WATERMARK_BYTES = 5 * 1024 * 1024
-MAX_VIDEO_BYTES = 20 * 1024 * 1024  # Bot API limit (will be bypassed by Pyrogram)
+MAX_VIDEO_BYTES = 20 * 1024 * 1024  # Bot API limit (bypassed by Telethon)
 PREVIEW_TILE_SIZE = (640, 360)
 PREVIEW_SIZES = [18, 26, 34, 42]
 WATERMARK_MARGIN = 20
@@ -90,8 +94,8 @@ db_pool: Optional[asyncpg.Pool] = None
 BOT_USERNAME: Optional[str] = BOT_USERNAME_ENV or None
 PROCESS_LOCK = asyncio.Lock()
 
-# Pyrogram client instance
-pyro_client: Optional[PyroClient] = None
+# Telethon client instance
+telethon_client: Optional[TelegramClient] = None
 
 
 @dataclass
@@ -668,22 +672,23 @@ async def ensure_bot_username(bot: Bot) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Pyrogram download helper
+# Telethon download helper
 # -----------------------------------------------------------------------------
 
-async def download_file_with_pyrogram(file_id: str, save_path: str) -> bool:
-    """Download file using Pyrogram (no size limit)."""
-    if pyro_client is None:
-        logger.error("Pyrogram client not available.")
+async def download_file_with_telethon(file_id: str, save_path: str) -> bool:
+    """Download file using Telethon (no size limit)."""
+    if telethon_client is None:
+        logger.error("Telethon client not available.")
         return False
     try:
-        await pyro_client.download_media(file_id, file_name=save_path)
+        # Telethon can download media by file_id
+        await telethon_client.download_media(file_id, file=save_path)
         return True
     except RPCError as e:
-        logger.error(f"Pyrogram download error: {e}")
+        logger.error(f"Telethon download error: {e}")
         return False
     except Exception as e:
-        logger.exception(f"Unexpected error in Pyrogram download: {e}")
+        logger.exception(f"Unexpected error in Telethon download: {e}")
         return False
 
 
@@ -972,7 +977,7 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Video handling for admin (with Pyrogram for large files)
+# Video handling for admin (with Telethon for large files)
 # -----------------------------------------------------------------------------
 
 def _is_video_message(message: Message) -> bool:
@@ -984,10 +989,6 @@ def _is_video_message(message: Message) -> bool:
 
 
 async def download_admin_video(message: Message) -> tuple[str, str, int]:
-    """
-    Download video using Pyrogram for any size.
-    Falls back to Bot API download (aiohttp) if Pyrogram is not available.
-    """
     if message.video:
         file_id = message.video.file_id
         filename = message.video.file_name or "video.mp4"
@@ -997,30 +998,30 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
         filename = message.document.file_name or "video.mp4"
         file_size = message.document.file_size or 0
 
-    # If Pyrogram is available, use it (no size limit)
-    if pyro_client is not None:
+    # If Telethon is available, use it (no size limit)
+    if telethon_client is not None:
         suffix = Path(filename).suffix or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
 
-        logger.info(f"Downloading {filename} ({file_size} bytes) with Pyrogram...")
+        logger.info(f"Downloading {filename} ({file_size} bytes) with Telethon...")
         try:
-            success = await download_file_with_pyrogram(file_id, tmp_path)
+            success = await download_file_with_telethon(file_id, tmp_path)
             if success:
-                logger.info("Download with Pyrogram successful.")
+                logger.info("Download with Telethon successful.")
                 return tmp_path, filename, file_size
             else:
-                logger.warning("Pyrogram download failed, falling back to Bot API download.")
+                logger.warning("Telethon download failed, falling back to Bot API download.")
         except Exception as e:
-            logger.exception(f"Pyrogram download error: {e}, falling back to Bot API.")
-        # If Pyrogram fails, fall through to Bot API method (which has 20MB limit)
+            logger.exception(f"Telethon download error: {e}, falling back to Bot API.")
+        # If Telethon fails, fall through to Bot API method
         safe_unlink(tmp_path)
 
-    # Fallback: use Bot API (aiohttp) - this will fail for >20MB but we keep it as a last resort
+    # Fallback: use Bot API (aiohttp) - this will fail for >20MB
     if file_size and file_size > MAX_VIDEO_BYTES:
         raise ValueError(
             "⚠️ حجم فایل بیش از حد مجاز برای دانلود از طریق Bot API (۲۰ مگابایت) است.\n"
-            "Pyrogram در دسترس نیست یا خطا دارد. لطفاً فایل را با حجم کمتر ارسال کنید."
+            "Telethon در دسترس نیست یا خطا دارد. لطفاً فایل را با حجم کمتر ارسال کنید."
         )
 
     try:
@@ -1028,8 +1029,8 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
     except TelegramBadRequest as exc:
         if "file is too big" in str(exc).lower():
             raise ValueError(
-                "⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است و Pyrogram در دسترس نیست.\n"
-                "لطفاً API_ID و API_HASH را به درستی تنظیم کنید یا فایل را فشرده کنید."
+                "⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است و Telethon در دسترس نیست.\n"
+                "لطفاً API_ID, API_HASH, USER_SESSION_STRING را به درستی تنظیم کنید."
             ) from exc
         raise ValueError(f"خطا در دریافت اطلاعات فایل: {exc}") from exc
 
@@ -1251,7 +1252,7 @@ async def help_cmd(message: Message) -> None:
         await message.answer(
             "Admin flow:\n"
             "1) Press Set watermark and upload a PNG.\n"
-            "2) Send a video (any size, Pyrogram will handle large files).\n"
+            "2) Send a video (any size, Telethon will handle large files if configured).\n"
             "3) Choose a size from the collage.\n"
             "4) The bot uploads the final video to the channel and gives you the link."
         )
@@ -1264,28 +1265,29 @@ async def help_cmd(message: Message) -> None:
 # -----------------------------------------------------------------------------
 
 async def on_startup(bot: Bot) -> None:
-    global pyro_client
+    global telethon_client
 
     await ensure_bot_username(bot)
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
 
-    # Start Pyrogram client if credentials are provided
-    if API_ID and API_HASH:
-        pyro_client = PyroClient(
-            "watermark_bot_user",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True,  # Use in-memory session to avoid file storage
+    # Start Telethon client if credentials and session are provided
+    if API_ID and API_HASH and USER_SESSION_STRING:
+        telethon_client = TelegramClient(
+            StringSession(USER_SESSION_STRING),
+            API_ID,
+            API_HASH,
         )
         try:
-            await pyro_client.start()
-            logger.info("Pyrogram client started successfully.")
+            await telethon_client.start()
+            # Verify connection
+            me = await telethon_client.get_me()
+            logger.info(f"Telethon client started successfully as @{me.username}")
         except Exception as e:
-            logger.error(f"Failed to start Pyrogram client: {e}")
-            pyro_client = None
+            logger.error(f"Failed to start Telethon client: {e}")
+            telethon_client = None
     else:
-        logger.warning("API_ID and API_HASH not set. Large file downloads will not work.")
+        logger.warning("API_ID, API_HASH, or USER_SESSION_STRING not set. Large file downloads will not work.")
 
     if WEBHOOK_BASE_URL:
         webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
@@ -1301,13 +1303,13 @@ async def on_shutdown(bot: Bot) -> None:
     except Exception:
         pass
 
-    global db_pool, pyro_client
-    if pyro_client is not None:
+    global db_pool, telethon_client
+    if telethon_client is not None:
         try:
-            await pyro_client.stop()
+            await telethon_client.disconnect()
         except Exception:
             pass
-        pyro_client = None
+        telethon_client = None
 
     if db_pool is not None:
         try:
