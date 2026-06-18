@@ -59,7 +59,6 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 # Telethon credentials (for userbot session)
-# These are the main credentials for the userbot that downloads files
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "").strip()
@@ -133,7 +132,7 @@ class LoginState(StatesGroup):
     waiting_for_api_hash = State()
     waiting_for_phone = State()
     waiting_for_code = State()
-    waiting_for_password = State()  # برای رمز دو مرحله‌ای
+    waiting_for_password = State()
 
 
 # -----------------------------------------------------------------------------
@@ -166,7 +165,6 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 
 
 async def check_video_file(file_path: str) -> tuple[bool, str]:
-    """Check if the video file is valid. Returns (is_valid, error_message)."""
     if not os.path.exists(file_path):
         return False, "فایل وجود ندارد"
     if os.path.getsize(file_path) < 1000:
@@ -177,7 +175,6 @@ async def check_video_file(file_path: str) -> tuple[bool, str]:
     if code != 0:
         return False, f"ffmpeg error: {err[:200]}"
     
-    # بررسی وجود moov atom
     cmd2 = [FFMPEG, "-v", "error", "-i", file_path, "-c", "copy", "-f", "null", "-"]
     code2, out2, err2 = await run_cmd(cmd2)
     if code2 != 0:
@@ -187,8 +184,6 @@ async def check_video_file(file_path: str) -> tuple[bool, str]:
 
 
 async def repair_video_file(input_path: str, output_path: str) -> tuple[bool, str]:
-    """Repair video file. Returns (success, error_message)."""
-    # روش 1: کپی با faststart
     cmd = [
         FFMPEG, "-y",
         "-err_detect", "ignore_err",
@@ -203,7 +198,6 @@ async def repair_video_file(input_path: str, output_path: str) -> tuple[bool, st
         if is_valid:
             return True, ""
     
-    # روش 2: تبدیل کامل
     cmd2 = [
         FFMPEG, "-y",
         "-err_detect", "ignore_err",
@@ -402,12 +396,11 @@ def resize_watermark_for_video(
 
 
 # -----------------------------------------------------------------------------
-# Database helpers (corrected)
+# Database helpers
 # -----------------------------------------------------------------------------
 
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
-        # Settings table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -431,7 +424,6 @@ async def init_db(pool: asyncpg.Pool) -> None:
         except Exception:
             pass
         
-        # Videos table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS videos (
@@ -444,7 +436,6 @@ async def init_db(pool: asyncpg.Pool) -> None:
             """
         )
         
-        # User data table (for link feature and login)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS user_data (
@@ -459,7 +450,6 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
             """
         )
-        # Add optional columns if they don't exist
         for col, col_type in [
             ("reply_msg_id", "INTEGER DEFAULT NULL"),
             ("reply_active", "BOOLEAN DEFAULT FALSE"),
@@ -474,9 +464,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
 
 
 async def get_user_data(user_id: int) -> Optional[dict]:
-    """Get user data from database using the connection pool."""
     if db_pool is None:
-        logger.warning("db_pool is None in get_user_data")
         return None
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow('SELECT * FROM user_data WHERE user_id = $1', user_id)
@@ -484,14 +472,11 @@ async def get_user_data(user_id: int) -> Optional[dict]:
 
 
 async def save_user_data(user_id: int, **kwargs) -> None:
-    """Save or update user data."""
     if db_pool is None:
-        logger.warning("db_pool is None in save_user_data")
         return
     async with db_pool.acquire() as conn:
         existing = await get_user_data(user_id)
         if existing:
-            # Update
             fields = []
             values = []
             for key, val in kwargs.items():
@@ -501,7 +486,6 @@ async def save_user_data(user_id: int, **kwargs) -> None:
             query = f"UPDATE user_data SET {', '.join(fields)} WHERE user_id = ${len(values)}"
             await conn.execute(query, *values)
         else:
-            # Insert
             columns = list(kwargs.keys()) + ['user_id']
             placeholders = ', '.join([f"${i+1}" for i in range(len(columns))])
             values = list(kwargs.values()) + [user_id]
@@ -759,11 +743,12 @@ async def handle_user_start_flow(message: Message, payload: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Admin UI
+# Admin UI (با دکمه لاگین)
 # -----------------------------------------------------------------------------
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text="🔐 لاگین", callback_data="login")
     kb.button(text="⚙️ Set watermark", callback_data="wm:set")
     kb.button(text="ℹ️ Current settings", callback_data="wm:info")
     kb.button(text="➕ تنظیم جوین اجباری", callback_data="join:add")
@@ -896,7 +881,6 @@ async def login_code(message: Message, state: FSMContext) -> None:
         await client.sign_in(data['phone'], code)
         session_string = client.session.save()
         await client.disconnect()
-        # Save session to database
         user_id = message.from_user.id
         await save_user_data(
             user_id,
@@ -906,8 +890,7 @@ async def login_code(message: Message, state: FSMContext) -> None:
         )
         await message.answer("✅ لاگین موفقیت‌آمیز بود.\nاکنون می‌توانید از قابلیت لینک استفاده کنید.")
         await state.clear()
-        # Show admin panel
-        await cmd_start(message, state)  # Reuse start
+        await cmd_start(message, state)
     except SessionPasswordNeededError:
         await state.set_state(LoginState.waiting_for_password)
         await message.answer("🔐 حساب شما رمز دو مرحله‌ای دارد.\nلطفاً رمز خود را وارد کنید:")
@@ -947,16 +930,12 @@ async def login_password(message: Message, state: FSMContext) -> None:
 # -----------------------------------------------------------------------------
 
 async def download_file_with_telethon(file_id: str, save_path: str, storage_channel: int) -> tuple[bool, str]:
-    """Download file using Telethon with detailed error logging.
-    Returns (success, error_message).
-    """
     if telethon_client is None:
         return False, "Telethon client not available"
     
     try:
         logger.info(f"Telethon: Starting download of file_id={file_id}")
         
-        # اول بررسی می‌کنیم که آیا اکانت یوزربات به کانال دسترسی دارد
         try:
             chat = await telethon_client.get_entity(storage_channel)
             logger.info(f"Telethon: Successfully accessed channel {storage_channel}")
@@ -967,10 +946,8 @@ async def download_file_with_telethon(file_id: str, save_path: str, storage_chan
             logger.error(f"Telethon: Error accessing channel: {e}")
             return False, f"خطا در دسترسی به کانال: {e}"
         
-        # دانلود فایل
         await telethon_client.download_media(file_id, file=save_path)
         
-        # بررسی اندازه فایل دانلود شده
         if not os.path.exists(save_path):
             return False, "فایل دانلود نشد (مسیر وجود ندارد)"
         
@@ -980,14 +957,12 @@ async def download_file_with_telethon(file_id: str, save_path: str, storage_chan
         if file_size < 1000:
             return False, f"فایل دانلود شده بسیار کوچک است ({file_size} bytes) - احتمالاً فایل در دسترس نیست یا اکانت به آن دسترسی ندارد"
         
-        # بررسی صحت فایل
         is_valid, err_msg = await check_video_file(save_path)
         if is_valid:
             return True, ""
         
         logger.warning(f"Telethon: File validation failed: {err_msg}. Attempting repair...")
         
-        # ترمیم فایل
         repaired_path = save_path + ".repaired.mp4"
         success, repair_err = await repair_video_file(save_path, repaired_path)
         if success:
@@ -1030,10 +1005,7 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
 
     logger.info(f"===== STARTING DOWNLOAD =====")
     logger.info(f"File: {filename}, Size: {file_size} bytes, ID: {file_id}")
-    logger.info(f"MAX_VIDEO_BYTES: {MAX_VIDEO_BYTES}")
-    logger.info(f"Telethon client available: {telethon_client is not None}")
 
-    # ========== روش 1: دانلود با aiohttp (برای فایل‌های کوچک) ==========
     if file_size <= MAX_VIDEO_BYTES:
         logger.info(f"Method 1: aiohttp download (small file: {file_size} <= {MAX_VIDEO_BYTES})")
         try:
@@ -1065,7 +1037,6 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
             else:
                 safe_unlink(tmp_path)
                 logger.warning(f"aiohttp download file invalid: {err_msg}")
-                # تلاش برای ترمیم
                 repaired_path = tmp_path + ".repaired.mp4"
                 success, repair_err = await repair_video_file(tmp_path, repaired_path)
                 if success:
@@ -1075,10 +1046,8 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
                 
         except Exception as e:
             logger.error(f"aiohttp download error: {e}")
-            # اگر aiohttp خطا داد، به روش بعدی برویم
             pass
 
-    # ========== روش 2: دانلود با Telethon (برای فایل‌های بزرگ یا زمانی که aiohttp خطا داد) ==========
     if telethon_client is not None:
         logger.info(f"Method 2: Telethon download")
         suffix = Path(filename).suffix or ".mp4"
@@ -1095,7 +1064,6 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
             safe_unlink(tmp_path)
             logger.error(f"Telethon download failed: {error_msg}")
             
-            # اگر خطای دسترسی بود، پیام واضح بده
             if "دسترسی ندارد" in error_msg or "عضو نیست" in error_msg:
                 raise ValueError(
                     f"❌ {error_msg}\n\n"
@@ -1130,7 +1098,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         if payload:
             await message.answer("پنل ادمین", reply_markup=admin_keyboard())
             return
-        # بررسی لاگین
+        
         data = await get_user_data(message.from_user.id)
         is_logged_in = data and data.get('session_string')
         login_status = "✅ لاگین هستید" if is_logged_in else "❌ لاگین نیستید"
@@ -1139,6 +1107,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             has_wm = bool(settings.get("watermark_png"))
         except Exception:
             has_wm = False
+            
         text = (
             "👋 <b>پنل ادمین</b>\n\n"
             f"🟢 واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
@@ -1148,6 +1117,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         )
         await message.answer(text, reply_markup=admin_keyboard())
         return
+    
     missing = await get_missing_joins(message.bot, message.from_user.id)
     if missing:
         await send_join_required_prompt(message, payload)
@@ -1161,20 +1131,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 # ========== هندلر لینک تلگرام ==========
 @router.message(F.text & F.chat.type == "private")
 async def handle_telegram_link(message: Message, state: FSMContext) -> None:
-    """دریافت لینک تلگرام و پردازش ویدیو"""
     if not is_admin(message.from_user.id):
         return
     
-    # بررسی اینکه آیا در حال تنظیم واترمارک هستیم
     if await state.get_state() == WatermarkState.waiting_for_png.state:
         return
     
     text = message.text.strip()
-    
-    # الگوی لینک تلگرام
     pattern = r'https?://t\.me/(?:c/)?([a-zA-Z][\w]+|\d+)/(\d+)'
     match = re.search(pattern, text)
-    
     if not match:
         return
     
@@ -1184,10 +1149,7 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     await message.answer("⏳ در حال دریافت ویدیو از لینک...")
     
     try:
-        # دریافت اطلاعات اکانت یوزربات از دیتابیس
         data = await get_user_data(message.from_user.id)
-        
-        # اگر کاربر لاگین نکرده باشد
         if not data or not data.get('session_string'):
             await message.answer(
                 "❌ **ابتدا لاگین کنید.**\n\n"
@@ -1201,20 +1163,15 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             )
             return
         
-        # اتصال با Telethon
         client = TelegramClient(StringSession(data['session_string']), data['api_id'], data['api_hash'])
         await client.connect()
         
-        # تبدیل chat_part به entity
         if chat_part.isdigit():
-            # لینک خصوصی: https://t.me/c/123456789/100
             chat_id = int(f"-100{chat_part}")
             entity = await client.get_entity(chat_id)
         else:
-            # لینک عمومی: https://t.me/username/100
             entity = await client.get_entity(chat_part)
         
-        # دریافت پیام
         tele_msg = await client.get_messages(entity, ids=msg_id)
         await client.disconnect()
         
@@ -1222,28 +1179,20 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             await message.answer("❌ پیام مورد نظر پیدا نشد.")
             return
         
-        # بررسی وجود رسانه و استخراج اطلاعات
         file_id_obj = None
         file_name = "video_from_link.mp4"
-        file_size = 0
-        duration = 0
         
         if tele_msg.video:
             file_id_obj = tele_msg.video.id
             file_name = getattr(tele_msg.video, 'file_name', 'video_from_link.mp4')
-            file_size = getattr(tele_msg.video, 'size', 0)
-            duration = getattr(tele_msg.video, 'duration', 0)
         elif tele_msg.document and tele_msg.document.mime_type and tele_msg.document.mime_type.startswith('video/'):
             file_id_obj = tele_msg.document.id
             file_name = getattr(tele_msg.document, 'file_name', 'video_from_link.mp4')
-            file_size = getattr(tele_msg.document, 'size', 0)
-            duration = getattr(tele_msg.document, 'duration', 0)
         
         if not file_id_obj:
             await message.answer("❌ پیام مورد نظر شامل ویدیو یا فایل ویدیویی نیست.")
             return
         
-        # دانلود با Telethon
         suffix = Path(file_name).suffix or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
@@ -1251,7 +1200,6 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
         client2 = TelegramClient(StringSession(data['session_string']), data['api_id'], data['api_hash'])
         await client2.connect()
         
-        # بررسی دسترسی به کانال
         try:
             await client2.get_entity(STORAGE_CHANNEL)
         except Exception as e:
@@ -1263,7 +1211,6 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             )
             return
         
-        # دانلود
         await client2.download_media(tele_msg, file=tmp_path)
         await client2.disconnect()
         
@@ -1271,7 +1218,6 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
             await message.answer("❌ دانلود ویدیو از لینک ناموفق بود.")
             return
         
-        # بررسی و ترمیم فایل
         is_valid, err_msg = await check_video_file(tmp_path)
         if not is_valid:
             repaired_path = tmp_path + ".repaired.mp4"
@@ -1282,7 +1228,6 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
                 await message.answer(f"⚠️ ویدیو خراب است: {err_msg}")
                 return
         
-        # ادامه فرآیند واترمارک
         settings = await get_watermark(db_pool)
         if not settings:
             await message.answer("Please set the watermark first using the admin panel.")
@@ -1332,7 +1277,7 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Callback handlers
+# Callback handlers (join, watermark, etc.)
 # -----------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("join:check:"))
@@ -1790,7 +1735,6 @@ async def on_startup(bot: Bot) -> None:
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
 
-    # Start Telethon client if credentials are provided
     if API_ID and API_HASH and USER_SESSION_STRING:
         telethon_client = TelegramClient(
             StringSession(USER_SESSION_STRING),
