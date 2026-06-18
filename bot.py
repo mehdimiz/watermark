@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import asyncpg
-from aiohttp import web
+from aiohttp import web, ClientTimeout
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
@@ -47,7 +47,7 @@ STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL", "-1003890591020"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip()
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -100,6 +100,10 @@ JOBS: dict[str, Job] = {}
 
 class WatermarkState(StatesGroup):
     waiting_for_png = State()
+
+
+class JoinState(StatesGroup):
+    waiting_for_links = State()
 
 
 # -----------------------------------------------------------------------------
@@ -392,6 +396,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 watermark_png BYTEA,
                 watermark_filename TEXT,
+                join_links TEXT NOT NULL DEFAULT '[]',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
@@ -403,6 +408,10 @@ async def init_db(pool: asyncpg.Pool) -> None:
             ON CONFLICT (id) DO NOTHING;
             """
         )
+        try:
+            await conn.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS join_links TEXT NOT NULL DEFAULT '[]';")
+        except Exception:
+            pass
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS videos (
@@ -478,12 +487,211 @@ async def get_video_mapping(pool: asyncpg.Pool, token: str) -> dict[str, Any] | 
 
 # -----------------------------------------------------------------------------
 # UI helpers
+
+async def get_join_links(pool: asyncpg.Pool) -> list[dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT join_links FROM settings WHERE id = 1")
+        if not row:
+            return []
+        raw = row["join_links"] or "[]"
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return []
+            cleaned: list[dict[str, Any]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("chat_id") is None or not item.get("url"):
+                    continue
+                cleaned.append(
+                    {
+                        "chat_id": int(item["chat_id"]),
+                        "url": str(item["url"]),
+                        "title": str(item.get("title") or ""),
+                        "label": str(item.get("label") or ""),
+                    }
+                )
+            return cleaned
+        except Exception:
+            return []
+
+
+async def save_join_links(pool: asyncpg.Pool, entries: list[dict[str, Any]]) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE settings
+            SET join_links = $1,
+                updated_at = NOW()
+            WHERE id = 1
+            """,
+            json.dumps(entries, ensure_ascii=False),
+        )
+
+
+def renumber_join_links(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(entries, start=1):
+        normalized.append(
+            {
+                "chat_id": int(item["chat_id"]),
+                "url": str(item["url"]),
+                "title": str(item.get("title") or f"کانال {idx}"),
+                "label": f"💧عضویت {idx}",
+            }
+        )
+    return normalized
+
+
+def build_join_keyboard(entries: list[dict[str, Any]], payload: str = "") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for item in entries:
+        kb.button(text=item["label"], url=item["url"])
+    kb.button(text="✅ عضو شدم", callback_data=f"join:check:{payload or '_'}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def build_join_remove_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for idx, item in enumerate(entries):
+        kb.button(text=f"❌ {item['label']}", callback_data=f"join:remove:{idx}")
+    if entries:
+        kb.button(text="🗑 حذف همه", callback_data="join:clear")
+    kb.button(text="↩️ بازگشت", callback_data="join:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def format_join_list(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return "فعلاً هیچ جوین اجباری‌ای تنظیم نشده است."
+    lines = ["<b>فهرست جوین اجباری</b>", ""]
+    for item in entries:
+        title = item.get("title") or item["label"]
+        lines.append(f"• {item['label']} — <a href=\"{item['url']}\">{title}</a>")
+    return "\n".join(lines)
+
+
+async def resolve_join_target(bot: Bot, raw_value: str) -> dict[str, Any]:
+    raw = raw_value.strip()
+    if not raw:
+        raise ValueError("ورودی خالی است.")
+
+    if raw.startswith("@"):
+        ref: Any = raw
+    elif raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
+        tail = raw.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        if tail.startswith("+") or "joinchat" in tail:
+            raise ValueError(
+                "لینک‌های خصوصیِ دعوت برای جوین اجباریِ قابل‌بررسی مناسب نیستند. "
+                "لطفاً یوزرنیم عمومی کانال را با @ یا لینک public t.me ارسال کنید."
+            )
+        ref = "@" + tail.lstrip("@")
+    elif raw.lstrip("-").isdigit():
+        ref = int(raw)
+    else:
+        raise ValueError("فرمت لینک نامعتبر است. از @username یا لینک public t.me استفاده کنید.")
+
+    chat = await bot.get_chat(ref)
+    username = getattr(chat, "username", None)
+    title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or "کانال"
+
+    if not username:
+        if isinstance(ref, int):
+            raise ValueError(
+                "این چت یوزرنیم عمومی ندارد. برای جوین اجباری، لطفاً کانال public با @username اضافه کنید."
+            )
+        raise ValueError("برای ساخت دکمه عضویت، چت باید public و دارای یوزرنیم باشد.")
+
+    return {"chat_id": int(chat.id), "url": f"https://t.me/{username}", "title": title, "label": ""}
+
+
+async def get_missing_joins(bot: Bot, user_id: int) -> list[dict[str, Any]]:
+    if user_id == ADMIN_ID:
+        return []
+    entries = renumber_join_links(await get_join_links(db_pool))
+    if not entries:
+        return []
+    missing: list[dict[str, Any]] = []
+    for item in entries:
+        try:
+            member = await bot.get_chat_member(item["chat_id"], user_id)
+            status = getattr(member, "status", "")
+            if status not in {"creator", "administrator", "member", "restricted"}:
+                missing.append(item)
+        except Exception:
+            missing.append(item)
+    return missing
+
+
+async def send_join_required_prompt(message: Message, payload: str = "") -> None:
+    entries = renumber_join_links(await get_join_links(db_pool))
+    if not entries:
+        return
+    text = (
+        "⚠️ <b>برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شوید:</b>\n\n"
+        f"{format_join_list(entries)}\n\n"
+        "بعد از عضویت روی دکمه «✅ عضو شدم» بزنید."
+    )
+    await message.answer(text, reply_markup=build_join_keyboard(entries, payload))
+
+
+async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
+    mapping = await get_video_mapping(db_pool, token)
+    if not mapping:
+        await bot.send_message(chat_id, "این لینک نامعتبر است یا ویدیو دیگر در دسترس نیست.")
+        return
+
+    warning = await bot.send_message(
+        chat_id,
+        "⚠️ ویدیو را همین حالا ذخیره کنید.\n"
+        "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
+    )
+
+    try:
+        copied = await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=STORAGE_CHANNEL,
+            message_id=mapping["channel_message_id"],
+        )
+        copied_message_id = copied.message_id if hasattr(copied, "message_id") else copied
+    except TelegramBadRequest:
+        await warning.edit_text("ویدیو در کانال ذخیره‌سازی در دسترس نیست.")
+        return
+    except TelegramForbiddenError:
+        await warning.edit_text("امکان ارسال پیام به این کاربر وجود ندارد.")
+        return
+
+    asyncio.create_task(
+        delete_later(bot, chat_id, [warning.message_id, copied_message_id], 10)
+    )
+
+
+async def handle_user_start_flow(message: Message, payload: str) -> None:
+    missing = await get_missing_joins(message.bot, message.from_user.id)
+    if missing:
+        await send_join_required_prompt(message, payload)
+        return
+
+    if payload:
+        await deliver_user_video(message.bot, message.chat.id, payload)
+    else:
+        await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
+
+
+# -----------------------------------------------------------------------------
+# UI helpers
 # -----------------------------------------------------------------------------
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⚙️ Set watermark", callback_data="wm:set")
     kb.button(text="ℹ️ Current settings", callback_data="wm:info")
+    kb.button(text="➕ تنظیم جوین اجباری", callback_data="join:add")
+    kb.button(text="➖ حذف جوین اجباری", callback_data="join:remove")
+    kb.button(text="📋 لیست جوین اجباری", callback_data="join:list")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -558,14 +766,13 @@ async def ensure_bot_username(bot: Bot) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if is_admin(message.from_user.id):
-        payload = ""
-        if message.text and " " in message.text:
-            payload = message.text.split(" ", 1)[1].strip()
+    payload = ""
+    if message.text and " " in message.text:
+        payload = message.text.split(" ", 1)[1].strip()
 
+    if is_admin(message.from_user.id):
         if payload:
-            # Admin deep-link is not used in this bot, but we keep the handler symmetric.
-            await message.answer("Admin panel", reply_markup=admin_keyboard())
+            await message.answer("پنل ادمین", reply_markup=admin_keyboard())
             return
 
         try:
@@ -574,51 +781,202 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         except Exception as e:
             logger.exception("Admin settings load failed: %s", e)
             has_wm = False
+
         text = (
-            "👋 <b>Admin panel</b>\n\n"
-            f"Watermark: <b>{'saved' if has_wm else 'not set'}</b>\n"
-            "Send a video to generate a preview collage and choose size per video.\n"
-            "Press <b>Set watermark</b> to upload a PNG watermark."
+            "👋 <b>پنل ادمین</b>\n\n"
+            f"واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
+            "برای تنظیم واترمارک، جوین اجباری و پردازش ویدیو از دکمه‌های زیر استفاده کنید."
         )
         await message.answer(text, reply_markup=admin_keyboard())
         return
 
-    # User deep link
-    payload = ""
-    if message.text and " " in message.text:
-        payload = message.text.split(" ", 1)[1].strip()
+    missing = await get_missing_joins(message.bot, message.from_user.id)
+    if missing:
+        await send_join_required_prompt(message, payload)
+        return
 
     if not payload:
-        await message.answer("Send me the bot link you received from the admin.")
+        await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
         return
 
-    mapping = await get_video_mapping(db_pool, payload)
-    if not mapping:
-        await message.answer("This link is invalid or the video is not available.")
-        return
+    await deliver_user_video(message.bot, message.chat.id, payload)
 
-    # Defer deletion of the sent video and warning message.
-    warning = await message.answer(
-        "⚠️ Save this video now.\nIt will be removed from this chat in 10 seconds."
-    )
 
+@router.callback_query(F.data.startswith("join:check:"))
+async def cb_join_check(call: CallbackQuery) -> None:
+    payload = ""
     try:
-        copied = await message.bot.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=STORAGE_CHANNEL,
-            message_id=mapping["channel_message_id"],
-        )
-        copied_message_id = copied.message_id if hasattr(copied, "message_id") else copied
-    except TelegramBadRequest:
-        await warning.edit_text("The video is unavailable in storage channel.")
-        return
-    except TelegramForbiddenError:
-        await warning.edit_text("I cannot send messages to this user.")
+        payload = call.data.split(":", 2)[2]
+    except Exception:
+        payload = "_"
+
+    if not call.from_user:
+        await call.answer("Not allowed", show_alert=True)
         return
 
-    asyncio.create_task(
-        delete_later(message.bot, message.chat.id, [warning.message_id, copied_message_id], 10)
+    missing = await get_missing_joins(call.bot, call.from_user.id)
+    if missing:
+        await call.answer("هنوز همه عضویت‌ها کامل نشده است.", show_alert=True)
+        try:
+            await call.message.edit_reply_markup(
+                reply_markup=build_join_keyboard(
+                    renumber_join_links(await get_join_links(db_pool)),
+                    payload if payload != "_" else ""
+                )
+            )
+        except Exception:
+            pass
+        return
+
+    await call.answer("عضویت تأیید شد")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    if payload and payload != "_":
+        await deliver_user_video(call.bot, call.message.chat.id, payload)
+    else:
+        await call.message.answer("✅ عضویت شما تأیید شد. حالا می‌توانید دوباره از ربات استفاده کنید.")
+
+
+@router.callback_query(F.data == "join:add")
+
+async def cb_join_add(call: CallbackQuery, state: FSMContext) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await state.set_state(JoinState.waiting_for_links)
+    await call.message.answer(
+        "لطفاً لینک‌های جوین اجباری را ارسال کنید.\n"
+        "هر لینک در یک خط جداگانه باشد.\n"
+        "از @username یا لینک public t.me استفاده کنید."
     )
+    await call.answer()
+
+
+@router.callback_query(F.data == "join:list")
+async def cb_join_list(call: CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    entries = renumber_join_links(await get_join_links(db_pool))
+    text = format_join_list(entries)
+    if not entries:
+        await call.message.answer(text)
+    else:
+        await call.message.answer(text, reply_markup=build_join_remove_keyboard(entries))
+    await call.answer()
+
+
+@router.callback_query(F.data == "join:remove")
+async def cb_join_remove(call: CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    entries = renumber_join_links(await get_join_links(db_pool))
+    if not entries:
+        await call.message.answer("فعلاً هیچ جوین اجباری‌ای ثبت نشده است.")
+        await call.answer()
+        return
+    await call.message.answer(
+        "برای حذف، روی دکمه موردنظر بزنید:",
+        reply_markup=build_join_remove_keyboard(entries)
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "join:clear")
+async def cb_join_clear(call: CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await save_join_links(db_pool, [])
+    await call.message.answer("✅ همه جوین‌های اجباری حذف شدند.")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("join:remove:"))
+async def cb_join_remove_item(call: CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    try:
+        idx = int(call.data.split(":")[-1])
+    except Exception:
+        await call.answer("Invalid selection", show_alert=True)
+        return
+
+    entries = renumber_join_links(await get_join_links(db_pool))
+    if idx < 0 or idx >= len(entries):
+        await call.answer("Invalid selection", show_alert=True)
+        return
+
+    removed = entries.pop(idx)
+    await save_join_links(db_pool, entries)
+    await call.message.answer(
+        f"✅ حذف شد: {removed['label']} — {removed.get('title') or removed['label']}"
+    )
+    if entries:
+        await call.message.answer(
+            "فهرست به‌روزشده:",
+            reply_markup=build_join_remove_keyboard(entries)
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "join:back")
+async def cb_join_back(call: CallbackQuery) -> None:
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await call.message.answer("بازگشت به پنل ادمین:", reply_markup=admin_keyboard())
+    await call.answer()
+
+
+@router.message(JoinState.waiting_for_links)
+async def receive_join_links(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.text:
+        await message.answer("لطفاً لینک‌ها را به صورت متنی ارسال کنید.")
+        return
+
+    lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+    if not lines:
+        await message.answer("هیچ لینکی دریافت نشد.")
+        return
+
+    if not db_pool:
+        await message.answer("Database is not ready yet.")
+        return
+
+    current = renumber_join_links(await get_join_links(db_pool))
+    seen_chat_ids = {item["chat_id"] for item in current}
+    added = 0
+    errors: list[str] = []
+
+    for raw in lines:
+        try:
+            target = await resolve_join_target(message.bot, raw)
+            if target["chat_id"] in seen_chat_ids:
+                continue
+            current.append(target)
+            seen_chat_ids.add(target["chat_id"])
+            added += 1
+        except Exception as exc:
+            errors.append(f"• {raw} → {exc}")
+
+    current = renumber_join_links(current)
+    await save_join_links(db_pool, current)
+    await state.clear()
+
+    msg = f"✅ {added} لینک جدید اضافه شد."
+    if errors:
+        msg += "\n\n⚠️ برخی موارد نامعتبر بودند:\n" + "\n".join(errors[:5])
+    await message.answer(msg)
+
 
 
 @router.callback_query(F.data == "wm:set")
@@ -642,13 +1000,16 @@ async def cb_info(call: CallbackQuery) -> None:
     try:
         settings = await get_settings(db_pool)
         has_wm = bool(settings.get("watermark_png"))
+        join_count = len(renumber_join_links(await get_join_links(db_pool)))
     except Exception as e:
         logger.exception("Settings load failed: %s", e)
         has_wm = False
+        join_count = 0
     updated_at = settings.get("updated_at")
     text = (
         "<b>Current settings</b>\n\n"
         f"Watermark saved: <b>{'yes' if has_wm else 'no'}</b>\n"
+        f"Join links: <b>{join_count}</b>\n"
         f"Updated at: <code>{updated_at}</code>\n"
         f"Storage channel: <code>{STORAGE_CHANNEL}</code>\n"
         f"Admin ID: <code>{ADMIN_ID}</code>"
@@ -735,11 +1096,26 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
     if file_size and file_size > MAX_VIDEO_BYTES:
         raise ValueError("Video is too large. Maximum allowed size is 200 MB.")
 
-    file = await message.bot.get_file(file_id)
+    try:
+        file = await message.bot.get_file(file_id)
+    except TelegramBadRequest as exc:
+        raise ValueError(
+            "تلگرام اجازه دسترسی به این فایل را از طریق Bot API نمی‌دهد. "
+            "لطفاً فایل را کمی کوچک‌تر یا به صورت فشرده‌تر ارسال کنید."
+        ) from exc
+
     suffix = Path(filename).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        await message.bot.download_file(file.file_path, destination=tmp)
         tmp_path = tmp.name
+
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+    timeout = ClientTimeout(total=None, sock_connect=60, sock_read=60)
+    async with message.bot.session.get(file_url, timeout=timeout) as resp:
+        resp.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                f.write(chunk)
+
     return tmp_path, filename, file_size
 
 
@@ -771,7 +1147,7 @@ async def admin_video_entry(message: Message, state: FSMContext) -> None:
     try:
         video_path, original_name, _ = await download_admin_video(message)
     except Exception as exc:
-        await message.answer(f"Failed to download video: {exc}")
+        await message.answer(f"❌ دانلود ویدیو ناموفق بود:\n{exc}")
         return
 
     job_id = secrets.token_hex(4)
@@ -847,6 +1223,12 @@ async def cb_choose_size(call: CallbackQuery) -> None:
     job.status = "queued"
     job.chosen_index = idx
     size_percent = PREVIEW_SIZES[idx]
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
     await call.answer(f"Selected {size_percent}%")
 
     # Process in the background so the callback returns immediately.
