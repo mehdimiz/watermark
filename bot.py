@@ -392,14 +392,12 @@ def resize_watermark_for_video(
 
 
 # -----------------------------------------------------------------------------
-# Database helpers
+# Database helpers (corrected)
 # -----------------------------------------------------------------------------
-
-async def get_conn():
-    return await asyncpg.connect(DATABASE_URL)
 
 async def init_db(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
+        # Settings table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -422,6 +420,8 @@ async def init_db(pool: asyncpg.Pool) -> None:
             await conn.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS join_links TEXT NOT NULL DEFAULT '[]';")
         except Exception:
             pass
+        
+        # Videos table
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS videos (
@@ -433,7 +433,8 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
             """
         )
-        # جدول user_data برای ذخیره اطلاعات کاربران (برای قابلیت لینک)
+        
+        # User data table (for link feature)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS user_data (
@@ -448,43 +449,39 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
             """
         )
-        # اضافه کردن ستون‌های reply و auto_video اگر وجود ندارند
-        try:
-            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_msg_id INTEGER DEFAULT NULL;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_active BOOLEAN DEFAULT FALSE;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS reply_chat_id BIGINT DEFAULT NULL;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS auto_video_enabled BOOLEAN DEFAULT FALSE;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("ALTER TABLE user_data ADD COLUMN IF NOT EXISTS auto_video_path TEXT DEFAULT NULL;")
-        except Exception:
-            pass
+        # Add optional columns if they don't exist
+        for col, col_type in [
+            ("reply_msg_id", "INTEGER DEFAULT NULL"),
+            ("reply_active", "BOOLEAN DEFAULT FALSE"),
+            ("reply_chat_id", "BIGINT DEFAULT NULL"),
+            ("auto_video_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("auto_video_path", "TEXT DEFAULT NULL"),
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE user_data ADD COLUMN IF NOT EXISTS {col} {col_type};")
+            except Exception:
+                pass
 
 
 async def get_user_data(user_id: int) -> Optional[dict]:
-    """دریافت اطلاعات کاربر از دیتابیس"""
-    async with get_conn() as conn:
+    """Get user data from database using the connection pool."""
+    if db_pool is None:
+        logger.warning("db_pool is None in get_user_data")
+        return None
+    async with db_pool.acquire() as conn:
         row = await conn.fetchrow('SELECT * FROM user_data WHERE user_id = $1', user_id)
         return dict(row) if row else None
 
 
 async def save_user_data(user_id: int, **kwargs) -> None:
-    """ذخیره یا به‌روزرسانی اطلاعات کاربر"""
-    async with get_conn() as conn:
-        # دریافت اطلاعات موجود
+    """Save or update user data."""
+    if db_pool is None:
+        logger.warning("db_pool is None in save_user_data")
+        return
+    async with db_pool.acquire() as conn:
         existing = await get_user_data(user_id)
         if existing:
-            # به‌روزرسانی
+            # Update
             fields = []
             values = []
             for key, val in kwargs.items():
@@ -494,17 +491,13 @@ async def save_user_data(user_id: int, **kwargs) -> None:
             query = f"UPDATE user_data SET {', '.join(fields)} WHERE user_id = ${len(values)}"
             await conn.execute(query, *values)
         else:
-            # درج جدید
+            # Insert
             columns = list(kwargs.keys()) + ['user_id']
             placeholders = ', '.join([f"${i+1}" for i in range(len(columns))])
             values = list(kwargs.values()) + [user_id]
             query = f"INSERT INTO user_data ({', '.join(columns)}) VALUES ({placeholders})"
             await conn.execute(query, *values)
 
-
-# -----------------------------------------------------------------------------
-# UI helpers
-# -----------------------------------------------------------------------------
 
 async def get_settings(pool: asyncpg.Pool) -> dict[str, Any]:
     async with pool.acquire() as conn:
@@ -1044,7 +1037,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await deliver_user_video(message.bot, message.chat.id, payload)
 
 
-# ========== هندلر لینک تلگرام (با دسترسی به get_user_data) ==========
+# ========== هندلر لینک تلگرام ==========
 @router.message(F.text & F.chat.type == "private")
 async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     """دریافت لینک تلگرام و پردازش ویدیو"""
