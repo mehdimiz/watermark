@@ -33,6 +33,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+# Pyrogram for downloading large files
+from pyrogram import Client as PyroClient
+from pyrogram.errors import RPCError
+
 try:
     import imageio_ffmpeg
 except Exception:
@@ -51,10 +55,17 @@ WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
+# Pyrogram credentials (required for large file downloads)
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+
+if not API_ID or not API_HASH:
+    logging.warning("API_ID and API_HASH are not set. Large file downloads (>20MB) will fail.")
+
 MAX_WATERMARK_BYTES = 5 * 1024 * 1024
-MAX_VIDEO_BYTES = 200 * 1024 * 1024
+MAX_VIDEO_BYTES = 20 * 1024 * 1024  # Bot API limit (will be bypassed by Pyrogram)
 PREVIEW_TILE_SIZE = (640, 360)
-PREVIEW_SIZES = [18, 26, 34, 42]  # percentages of the frame width
+PREVIEW_SIZES = [18, 26, 34, 42]
 WATERMARK_MARGIN = 20
 OUTPUT_MAX_WIDTH = 1280
 
@@ -79,6 +90,9 @@ db_pool: Optional[asyncpg.Pool] = None
 BOT_USERNAME: Optional[str] = BOT_USERNAME_ENV or None
 PROCESS_LOCK = asyncio.Lock()
 
+# Pyrogram client instance
+pyro_client: Optional[PyroClient] = None
+
 
 @dataclass
 class Job:
@@ -90,7 +104,7 @@ class Job:
     preview_path: str
     frame_width: int
     frame_height: int
-    status: str = "pending"  # pending | queued | processing | done | failed
+    status: str = "pending"
     chosen_index: Optional[int] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -136,19 +150,7 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 
 
 async def extract_frame(video_path: str, out_path: str, at_seconds: float = 1.0) -> None:
-    cmd = [
-        FFMPEG,
-        "-y",
-        "-ss",
-        str(at_seconds),
-        "-i",
-        video_path,
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        out_path,
-    ]
+    cmd = [FFMPEG, "-y", "-ss", str(at_seconds), "-i", video_path, "-frames:v", "1", "-q:v", "2", out_path]
     code, _, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"Frame extraction failed: {err[-1000:]}")
@@ -166,40 +168,25 @@ async def render_video_with_watermark(
     margin = WATERMARK_MARGIN
 
     cmd = [
-        FFMPEG,
-        "-y",
-        "-i",
-        input_path,
-        "-i",
-        watermark_path,
+        FFMPEG, "-y",
+        "-i", input_path,
+        "-i", watermark_path,
         "-filter_complex",
         f"[0:v]scale={target_width}:-2,format=yuv420p[base];[1:v]scale={watermark_width}:-1[wm];[base][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto[v]",
-        "-map",
-        "[v]",
-        "-map",
-        "0:a?",
-        "-map_metadata",
-        "-1",
-        "-map_chapters",
-        "-1",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
+        "-map", "[v]",
+        "-map", "0:a?",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
         "-shortest",
         output_path,
     ]
-
     code, _, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"Video rendering failed: {err[-1500:]}")
@@ -602,7 +589,7 @@ async def handle_user_start_flow(message: Message, payload: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# UI helpers
+# Admin UI
 # -----------------------------------------------------------------------------
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -681,6 +668,26 @@ async def ensure_bot_username(bot: Bot) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Pyrogram download helper
+# -----------------------------------------------------------------------------
+
+async def download_file_with_pyrogram(file_id: str, save_path: str) -> bool:
+    """Download file using Pyrogram (no size limit)."""
+    if pyro_client is None:
+        logger.error("Pyrogram client not available.")
+        return False
+    try:
+        await pyro_client.download_media(file_id, file_name=save_path)
+        return True
+    except RPCError as e:
+        logger.error(f"Pyrogram download error: {e}")
+        return False
+    except Exception as e:
+        logger.exception(f"Unexpected error in Pyrogram download: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Admin handlers
 # -----------------------------------------------------------------------------
 
@@ -701,8 +708,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         try:
             settings = await get_settings(db_pool)
             has_wm = bool(settings.get("watermark_png"))
-        except Exception as e:
-            logger.exception("Admin settings load failed: %s", e)
+        except Exception:
             has_wm = False
         text = (
             "👋 <b>پنل ادمین</b>\n\n"
@@ -905,8 +911,7 @@ async def cb_info(call: CallbackQuery) -> None:
         settings = await get_settings(db_pool)
         has_wm = bool(settings.get("watermark_png"))
         join_count = len(renumber_join_links(await get_join_links(db_pool)))
-    except Exception as e:
-        logger.exception("Settings load failed: %s", e)
+    except Exception:
         has_wm = False
         join_count = 0
     updated_at = settings.get("updated_at")
@@ -967,7 +972,7 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Video handling for admin
+# Video handling for admin (with Pyrogram for large files)
 # -----------------------------------------------------------------------------
 
 def _is_video_message(message: Message) -> bool:
@@ -979,6 +984,10 @@ def _is_video_message(message: Message) -> bool:
 
 
 async def download_admin_video(message: Message) -> tuple[str, str, int]:
+    """
+    Download video using Pyrogram for any size.
+    Falls back to Bot API download (aiohttp) if Pyrogram is not available.
+    """
     if message.video:
         file_id = message.video.file_id
         filename = message.video.file_name or "video.mp4"
@@ -988,18 +997,45 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
         filename = message.document.file_name or "video.mp4"
         file_size = message.document.file_size or 0
 
+    # If Pyrogram is available, use it (no size limit)
+    if pyro_client is not None:
+        suffix = Path(filename).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+
+        logger.info(f"Downloading {filename} ({file_size} bytes) with Pyrogram...")
+        try:
+            success = await download_file_with_pyrogram(file_id, tmp_path)
+            if success:
+                logger.info("Download with Pyrogram successful.")
+                return tmp_path, filename, file_size
+            else:
+                logger.warning("Pyrogram download failed, falling back to Bot API download.")
+        except Exception as e:
+            logger.exception(f"Pyrogram download error: {e}, falling back to Bot API.")
+        # If Pyrogram fails, fall through to Bot API method (which has 20MB limit)
+        safe_unlink(tmp_path)
+
+    # Fallback: use Bot API (aiohttp) - this will fail for >20MB but we keep it as a last resort
     if file_size and file_size > MAX_VIDEO_BYTES:
-        raise ValueError("Video is too large. Maximum allowed size is 200 MB.")
+        raise ValueError(
+            "⚠️ حجم فایل بیش از حد مجاز برای دانلود از طریق Bot API (۲۰ مگابایت) است.\n"
+            "Pyrogram در دسترس نیست یا خطا دارد. لطفاً فایل را با حجم کمتر ارسال کنید."
+        )
 
     try:
         file = await message.bot.get_file(file_id)
     except TelegramBadRequest as exc:
-        # Maybe the file is too large or inaccessible
-        raise ValueError(f"خطا در دریافت اطلاعات فایل از تلگرام: {exc}") from exc
+        if "file is too big" in str(exc).lower():
+            raise ValueError(
+                "⚠️ فایل بزرگ‌تر از ۲۰ مگابایت است و Pyrogram در دسترس نیست.\n"
+                "لطفاً API_ID و API_HASH را به درستی تنظیم کنید یا فایل را فشرده کنید."
+            ) from exc
+        raise ValueError(f"خطا در دریافت اطلاعات فایل: {exc}") from exc
 
     file_path = file.file_path
     if not file_path:
-        raise ValueError("Could not obtain file path from Telegram.")
+        raise ValueError("آدرس فایل دریافت نشد.")
 
     suffix = Path(filename).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -1008,25 +1044,18 @@ async def download_admin_video(message: Message) -> tuple[str, str, int]:
     url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
     timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_read=300)
 
-    logger.info(f"Starting download of {filename} ({file_size} bytes) from {url}")
-
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise ValueError(f"Download failed with status {response.status}: {error_text[:200]}")
+                    raise ValueError(f"دانلود ناموفق: {error_text[:200]}")
                 with open(tmp_path, "wb") as f:
-                    downloaded = 0
                     async for chunk in response.content.iter_chunked(8192):
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        if downloaded % (10 * 1024 * 1024) == 0:
-                            logger.info(f"Downloaded {downloaded // (1024*1024)} MB so far...")
-                logger.info(f"Download complete: {downloaded} bytes")
     except asyncio.TimeoutError:
         safe_unlink(tmp_path)
-        raise ValueError("زمان دانلود به پایان رسید. ممکن است فایل بسیار بزرگ باشد.")
+        raise ValueError("زمان دانلود به پایان رسید.")
     except Exception as e:
         safe_unlink(tmp_path)
         raise ValueError(f"خطا در دانلود: {str(e)}")
@@ -1222,7 +1251,7 @@ async def help_cmd(message: Message) -> None:
         await message.answer(
             "Admin flow:\n"
             "1) Press Set watermark and upload a PNG.\n"
-            "2) Send a video.\n"
+            "2) Send a video (any size, Pyrogram will handle large files).\n"
             "3) Choose a size from the collage.\n"
             "4) The bot uploads the final video to the channel and gives you the link."
         )
@@ -1235,9 +1264,29 @@ async def help_cmd(message: Message) -> None:
 # -----------------------------------------------------------------------------
 
 async def on_startup(bot: Bot) -> None:
+    global pyro_client
+
     await ensure_bot_username(bot)
     if db_pool is None:
         raise RuntimeError("Database pool not initialized")
+
+    # Start Pyrogram client if credentials are provided
+    if API_ID and API_HASH:
+        pyro_client = PyroClient(
+            "watermark_bot_user",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            in_memory=True,  # Use in-memory session to avoid file storage
+        )
+        try:
+            await pyro_client.start()
+            logger.info("Pyrogram client started successfully.")
+        except Exception as e:
+            logger.error(f"Failed to start Pyrogram client: {e}")
+            pyro_client = None
+    else:
+        logger.warning("API_ID and API_HASH not set. Large file downloads will not work.")
+
     if WEBHOOK_BASE_URL:
         webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -1251,13 +1300,22 @@ async def on_shutdown(bot: Bot) -> None:
         await bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
-    global db_pool
+
+    global db_pool, pyro_client
+    if pyro_client is not None:
+        try:
+            await pyro_client.stop()
+        except Exception:
+            pass
+        pyro_client = None
+
     if db_pool is not None:
         try:
             await db_pool.close()
         except Exception:
             pass
         db_pool = None
+
     try:
         await bot.session.close()
     except Exception:
