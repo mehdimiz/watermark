@@ -980,7 +980,10 @@ async def on_startup(bot: Bot) -> None:
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
         logger.info("Webhook set to %s", webhook_url)
     else:
-        logger.warning("WEBHOOK_BASE_URL is empty; webhook will not be registered.")
+        logger.warning(
+            "WEBHOOK_BASE_URL is empty; webhook will not be registered. "
+            "On Render, it should fall back to RENDER_EXTERNAL_URL automatically."
+        )
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -989,11 +992,25 @@ async def on_shutdown(bot: Bot) -> None:
     except Exception:
         pass
 
+    global db_pool
+    if db_pool is not None:
+        try:
+            await db_pool.close()
+        except Exception:
+            pass
+        db_pool = None
+
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
 
 async def init_app() -> web.Application:
     global db_pool
 
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    # Create the asyncpg pool on the same event loop that will serve webhook updates.
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1, statement_cache_size=0, command_timeout=60)
     await init_db(db_pool)
 
     bot = Bot(
@@ -1012,8 +1029,8 @@ async def init_app() -> web.Application:
 
 
 def main() -> None:
-    app = asyncio.run(init_app())
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    # Let aiohttp own the event loop so asyncpg/Bot are created on the same loop.
+    web.run_app(init_app(), host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
