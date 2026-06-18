@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -37,6 +38,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import RPCError, ChatAdminRequiredError, ChannelPrivateError
+from telethon.tl.functions.messages import GetMessagesRequest
 
 try:
     import imageio_ffmpeg
@@ -823,7 +825,113 @@ async def download_file_with_telethon(file_id: str, save_path: str, storage_chan
 
 
 # -----------------------------------------------------------------------------
-# Admin handlers (with video download)
+# Video download functions
+# -----------------------------------------------------------------------------
+
+def _is_video_message(message: Message) -> bool:
+    if message.video:
+        return True
+    if message.document and (message.document.mime_type or "").startswith("video/"):
+        return True
+    return False
+
+
+async def download_admin_video(message: Message) -> tuple[str, str, int]:
+    if message.video:
+        file_id = message.video.file_id
+        filename = message.video.file_name or "video.mp4"
+        file_size = message.video.file_size or 0
+    else:
+        file_id = message.document.file_id
+        filename = message.document.file_name or "video.mp4"
+        file_size = message.document.file_size or 0
+
+    logger.info(f"===== STARTING DOWNLOAD =====")
+    logger.info(f"File: {filename}, Size: {file_size} bytes, ID: {file_id}")
+    logger.info(f"MAX_VIDEO_BYTES: {MAX_VIDEO_BYTES}")
+    logger.info(f"Telethon client available: {telethon_client is not None}")
+
+    # ========== روش 1: دانلود با aiohttp (برای فایل‌های کوچک) ==========
+    if file_size <= MAX_VIDEO_BYTES:
+        logger.info(f"Method 1: aiohttp download (small file: {file_size} <= {MAX_VIDEO_BYTES})")
+        try:
+            file = await message.bot.get_file(file_id)
+            file_path = file.file_path
+            if not file_path:
+                raise ValueError("آدرس فایل دریافت نشد.")
+            
+            suffix = Path(filename).suffix or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp_path = tmp.name
+            
+            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=120)
+            
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise ValueError(f"دانلود ناموفق: {error_text[:200]}")
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            f.write(chunk)
+            
+            is_valid, err_msg = await check_video_file(tmp_path)
+            if is_valid:
+                logger.info("aiohttp download successful.")
+                return tmp_path, filename, file_size
+            else:
+                safe_unlink(tmp_path)
+                logger.warning(f"aiohttp download file invalid: {err_msg}")
+                # تلاش برای ترمیم
+                repaired_path = tmp_path + ".repaired.mp4"
+                success, repair_err = await repair_video_file(tmp_path, repaired_path)
+                if success:
+                    os.replace(repaired_path, tmp_path)
+                    return tmp_path, filename, file_size
+                raise ValueError(f"فایل دانلود شده خراب است: {err_msg}")
+                
+        except Exception as e:
+            logger.error(f"aiohttp download error: {e}")
+            # اگر aiohttp خطا داد، به روش بعدی برویم
+            pass
+
+    # ========== روش 2: دانلود با Telethon (برای فایل‌های بزرگ یا زمانی که aiohttp خطا داد) ==========
+    if telethon_client is not None:
+        logger.info(f"Method 2: Telethon download")
+        suffix = Path(filename).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+
+        logger.info(f"Downloading with Telethon to {tmp_path}...")
+        success, error_msg = await download_file_with_telethon(file_id, tmp_path, STORAGE_CHANNEL)
+        
+        if success:
+            logger.info("Telethon download successful.")
+            return tmp_path, filename, file_size
+        else:
+            safe_unlink(tmp_path)
+            logger.error(f"Telethon download failed: {error_msg}")
+            
+            # اگر خطای دسترسی بود، پیام واضح بده
+            if "دسترسی ندارد" in error_msg or "عضو نیست" in error_msg:
+                raise ValueError(
+                    f"❌ {error_msg}\n\n"
+                    "⚠️ راه‌حل: اکانت یوزربات را به کانال ذخیره‌سازی اضافه کنید.\n"
+                    f"کانال ID: {STORAGE_CHANNEL}\n"
+                    "سپس دوباره امتحان کنید."
+                )
+            raise ValueError(f"❌ خطا در دانلود با Telethon: {error_msg}")
+    else:
+        logger.error("Telethon client is not available")
+        raise ValueError(
+            "⚠️ Telethon در دسترس نیست.\n"
+            "لطفاً API_ID, API_HASH, USER_SESSION_STRING را تنظیم کنید."
+        )
+
+
+# -----------------------------------------------------------------------------
+# Admin handlers
 # -----------------------------------------------------------------------------
 
 @router.message(F.chat.type.in_({"group", "supergroup", "channel"}))
@@ -861,6 +969,185 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     await deliver_user_video(message.bot, message.chat.id, payload)
 
+
+# ========== هندلر لینک تلگرام ==========
+@router.message(F.text & F.chat.type == "private")
+async def handle_telegram_link(message: Message, state: FSMContext) -> None:
+    """دریافت لینک تلگرام و پردازش ویدیو"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    # بررسی اینکه آیا در حال تنظیم واترمارک هستیم
+    if await state.get_state() == WatermarkState.waiting_for_png.state:
+        return
+    
+    text = message.text.strip()
+    
+    # الگوی لینک تلگرام
+    pattern = r'https?://t\.me/(?:c/)?([a-zA-Z][\w]+|\d+)/(\d+)'
+    match = re.search(pattern, text)
+    
+    if not match:
+        return
+    
+    chat_part = match.group(1)
+    msg_id = int(match.group(2))
+    
+    await message.answer("⏳ در حال دریافت ویدیو از لینک...")
+    
+    try:
+        # دریافت اطلاعات اکانت یوزربات
+        data = await get_user_data(message.from_user.id)
+        if not data or not data['session_string']:
+            await message.answer("❌ ابتدا لاگین کنید.")
+            return
+        
+        # اتصال با Telethon
+        client = TelegramClient(StringSession(data['session_string']), data['api_id'], data['api_hash'])
+        await client.connect()
+        
+        # تبدیل chat_part به entity
+        if chat_part.isdigit():
+            # لینک خصوصی: https://t.me/c/123456789/100
+            chat_id = int(f"-100{chat_part}")
+            entity = await client.get_entity(chat_id)
+        else:
+            # لینک عمومی: https://t.me/username/100
+            entity = await client.get_entity(chat_part)
+        
+        # دریافت پیام
+        tele_msg = await client.get_messages(entity, ids=msg_id)
+        await client.disconnect()
+        
+        if not tele_msg or not tele_msg.media:
+            await message.answer("❌ پیام مورد نظر پیدا نشد یا شامل رسانه نیست.")
+            return
+        
+        # شبیه‌سازی یک پیام با ویدیو برای پردازش
+        # ساخت یک Message ساختگی با اطلاعات ویدیو
+        class FakeMessage:
+            def __init__(self, tele_msg, chat_id):
+                self.chat = type('obj', (object,), {'id': chat_id})()
+                self.from_user = message.from_user
+                self.message_id = tele_msg.id
+                self.date = tele_msg.date
+                
+                if tele_msg.video:
+                    self.video = type('obj', (object,), {
+                        'file_id': tele_msg.video.id,
+                        'file_name': getattr(tele_msg.video, 'file_name', 'video.mp4'),
+                        'file_size': getattr(tele_msg.video, 'size', 0),
+                        'duration': getattr(tele_msg.video, 'duration', 0),
+                        'mime_type': getattr(tele_msg.video, 'mime_type', 'video/mp4'),
+                    })()
+                elif tele_msg.document and tele_msg.document.mime_type and tele_msg.document.mime_type.startswith('video/'):
+                    self.document = type('obj', (object,), {
+                        'file_id': tele_msg.document.id,
+                        'file_name': getattr(tele_msg.document, 'file_name', 'video.mp4'),
+                        'file_size': getattr(tele_msg.document, 'size', 0),
+                        'mime_type': getattr(tele_msg.document, 'mime_type', 'video/mp4'),
+                    })()
+                else:
+                    await message.answer("❌ رسانه یافت نشد.")
+                    raise Exception("No media found")
+        
+        fake_msg = FakeMessage(tele_msg, entity.id)
+        
+        # دانلود ویدیو با استفاده از file_id
+        file_id_obj = getattr(fake_msg, 'video', getattr(fake_msg, 'document', None))
+        if not file_id_obj:
+            await message.answer("❌ رسانه یافت نشد.")
+            return
+        
+        file_id_str = file_id_obj.file_id
+        file_name = file_id_obj.file_name or "video_from_link.mp4"
+        
+        # دانلود با Telethon
+        suffix = Path(file_name).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+        
+        client2 = TelegramClient(StringSession(data['session_string']), data['api_id'], data['api_hash'])
+        await client2.connect()
+        
+        # بررسی دسترسی به کانال
+        try:
+            await client2.get_entity(STORAGE_CHANNEL)
+        except Exception as e:
+            await client2.disconnect()
+            await message.answer(f"❌ اکانت یوزربات به کانال ذخیره‌سازی دسترسی ندارد.\nلطفاً آن را به کانال اضافه کنید.\nکانال ID: {STORAGE_CHANNEL}")
+            return
+        
+        await client2.download_media(file_id_str, file=tmp_path)
+        await client2.disconnect()
+        
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
+            await message.answer("❌ دانلود ویدیو از لینک ناموفق بود.")
+            return
+        
+        # بررسی و ترمیم فایل
+        is_valid, err_msg = await check_video_file(tmp_path)
+        if not is_valid:
+            repaired_path = tmp_path + ".repaired.mp4"
+            success, repair_err = await repair_video_file(tmp_path, repaired_path)
+            if success:
+                os.replace(repaired_path, tmp_path)
+            else:
+                await message.answer(f"⚠️ ویدیو خراب است: {err_msg}")
+                return
+        
+        # ادامه فرآیند واترمارک
+        settings = await get_watermark(db_pool)
+        if not settings:
+            await message.answer("Please set the watermark first using the admin panel.")
+            return
+        
+        await message.answer("✅ ویدیو با موفقیت دریافت شد. در حال ساخت Preview...")
+        
+        job_id = secrets.token_hex(4)
+        temp_dir = tempfile.mkdtemp(prefix=f"wmjob_{job_id}_")
+        frame_path = str(Path(temp_dir) / "frame.jpg")
+        collage_path = str(Path(temp_dir) / "collage.jpg")
+        
+        await extract_frame(tmp_path, frame_path, at_seconds=1.0)
+        with Image.open(frame_path) as im:
+            frame_width, frame_height = im.size
+        
+        def _build() -> tuple[int, int]:
+            return build_preview_collage(frame_path, settings[0], collage_path)
+        
+        base_w, base_h = await asyncio.to_thread(_build)
+        
+        job = Job(
+            job_id=job_id,
+            admin_id=message.from_user.id,
+            source_path=tmp_path,
+            source_filename=file_name,
+            frame_path=frame_path,
+            preview_path=collage_path,
+            frame_width=base_w,
+            frame_height=base_h,
+        )
+        JOBS[job_id] = job
+        
+        caption = (
+            "🖼 <b>Choose the watermark size for this video</b>\n\n"
+            "The watermark position is fixed to <b>bottom-right</b>.\n"
+            "The chosen size will apply only to this video."
+        )
+        await message.answer_photo(
+            FSInputFile(collage_path),
+            caption=caption,
+            reply_markup=size_keyboard(job_id),
+        )
+        
+    except Exception as e:
+        await message.answer(f"❌ خطا در پردازش لینک: {str(e)}")
+
+
+# -----------------------------------------------------------------------------
+# Callback handlers
+# -----------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("join:check:"))
 async def cb_join_check(call: CallbackQuery) -> None:
@@ -1107,110 +1394,8 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Video handling with detailed logging
+# Video entry handler
 # -----------------------------------------------------------------------------
-
-def _is_video_message(message: Message) -> bool:
-    if message.video:
-        return True
-    if message.document and (message.document.mime_type or "").startswith("video/"):
-        return True
-    return False
-
-
-async def download_admin_video(message: Message) -> tuple[str, str, int]:
-    if message.video:
-        file_id = message.video.file_id
-        filename = message.video.file_name or "video.mp4"
-        file_size = message.video.file_size or 0
-    else:
-        file_id = message.document.file_id
-        filename = message.document.file_name or "video.mp4"
-        file_size = message.document.file_size or 0
-
-    logger.info(f"===== STARTING DOWNLOAD =====")
-    logger.info(f"File: {filename}, Size: {file_size} bytes, ID: {file_id}")
-    logger.info(f"MAX_VIDEO_BYTES: {MAX_VIDEO_BYTES}")
-    logger.info(f"Telethon client available: {telethon_client is not None}")
-
-    # ========== روش 1: دانلود با aiohttp (برای فایل‌های کوچک) ==========
-    if file_size <= MAX_VIDEO_BYTES:
-        logger.info(f"Method 1: aiohttp download (small file: {file_size} <= {MAX_VIDEO_BYTES})")
-        try:
-            file = await message.bot.get_file(file_id)
-            file_path = file.file_path
-            if not file_path:
-                raise ValueError("آدرس فایل دریافت نشد.")
-            
-            suffix = Path(filename).suffix or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp_path = tmp.name
-            
-            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-            timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=120)
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise ValueError(f"دانلود ناموفق: {error_text[:200]}")
-                    with open(tmp_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
-            
-            is_valid, err_msg = await check_video_file(tmp_path)
-            if is_valid:
-                logger.info("aiohttp download successful.")
-                return tmp_path, filename, file_size
-            else:
-                safe_unlink(tmp_path)
-                logger.warning(f"aiohttp download file invalid: {err_msg}")
-                # تلاش برای ترمیم
-                repaired_path = tmp_path + ".repaired.mp4"
-                success, repair_err = await repair_video_file(tmp_path, repaired_path)
-                if success:
-                    os.replace(repaired_path, tmp_path)
-                    return tmp_path, filename, file_size
-                raise ValueError(f"فایل دانلود شده خراب است: {err_msg}")
-                
-        except Exception as e:
-            logger.error(f"aiohttp download error: {e}")
-            # اگر aiohttp خطا داد، به روش بعدی برویم
-            pass
-
-    # ========== روش 2: دانلود با Telethon (برای فایل‌های بزرگ یا زمانی که aiohttp خطا داد) ==========
-    if telethon_client is not None:
-        logger.info(f"Method 2: Telethon download")
-        suffix = Path(filename).suffix or ".mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-
-        logger.info(f"Downloading with Telethon to {tmp_path}...")
-        success, error_msg = await download_file_with_telethon(file_id, tmp_path, STORAGE_CHANNEL)
-        
-        if success:
-            logger.info("Telethon download successful.")
-            return tmp_path, filename, file_size
-        else:
-            safe_unlink(tmp_path)
-            logger.error(f"Telethon download failed: {error_msg}")
-            
-            # اگر خطای دسترسی بود، پیام واضح بده
-            if "دسترسی ندارد" in error_msg or "عضو نیست" in error_msg:
-                raise ValueError(
-                    f"❌ {error_msg}\n\n"
-                    "⚠️ راه‌حل: اکانت یوزربات را به کانال ذخیره‌سازی اضافه کنید.\n"
-                    f"کانال ID: {STORAGE_CHANNEL}\n"
-                    "سپس دوباره امتحان کنید."
-                )
-            raise ValueError(f"❌ خطا در دانلود با Telethon: {error_msg}")
-    else:
-        logger.error("Telethon client is not available")
-        raise ValueError(
-            "⚠️ Telethon در دسترس نیست.\n"
-            "لطفاً API_ID, API_HASH, USER_SESSION_STRING را تنظیم کنید."
-        )
-
 
 @router.message(F.video | F.document)
 async def admin_video_entry(message: Message, state: FSMContext) -> None:
