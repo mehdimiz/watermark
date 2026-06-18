@@ -4,3 +4,5 @@ aiohttp==3.12.15
 Pillow==11.3.0
 imageio-ffmpeg==0.6.0
 python-dotenv==1.1.1
+pyrogram==2.0.106
+tgcrypto
