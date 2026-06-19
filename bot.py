@@ -134,6 +134,7 @@ class Job:
     preview_path: str
     frame_width: int
     frame_height: int
+    media_type: str = "video"
     status: str = "pending"
     chosen_index: Optional[int] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -283,6 +284,7 @@ def build_preview_collage(
     frame_path: str,
     watermark_bytes: bytes,
     out_path: str,
+    title: str = "Choose watermark size for this video",
 ) -> tuple[int, int]:
     frame = Image.open(frame_path).convert("RGB")
     watermark = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
@@ -326,7 +328,6 @@ def build_preview_collage(
         canvas.paste(tile, (x, y))
 
     draw = ImageDraw.Draw(canvas)
-    title = "Choose watermark size for this video"
     font = _load_font(26)
     bbox = draw.textbbox((0, 0), title, font=font)
     tw = bbox[2] - bbox[0]
@@ -385,6 +386,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 token TEXT UNIQUE NOT NULL,
                 channel_message_id BIGINT NOT NULL,
                 original_filename TEXT,
+                media_type TEXT NOT NULL DEFAULT 'video',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
@@ -410,6 +412,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
             ("reply_chat_id", "BIGINT DEFAULT NULL"),
             ("auto_video_enabled", "BOOLEAN DEFAULT FALSE"),
             ("auto_video_path", "TEXT DEFAULT NULL"),
+            ("media_type", "TEXT NOT NULL DEFAULT 'video'"),
         ]:
             try:
                 await conn.execute(f"ALTER TABLE user_data ADD COLUMN IF NOT EXISTS {col} {col_type};")
@@ -487,26 +490,111 @@ async def save_video_mapping(
     token: str,
     channel_message_id: int,
     original_filename: str | None,
+    media_type: str = "video",
 ) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO videos (token, channel_message_id, original_filename)
-            VALUES ($1, $2, $3)
+            INSERT INTO videos (token, channel_message_id, original_filename, media_type)
+            VALUES ($1, $2, $3, $4)
             """,
             token,
             channel_message_id,
             original_filename,
+            media_type,
         )
 
 
 async def get_video_mapping(pool: asyncpg.Pool, token: str) -> dict[str, Any] | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT token, channel_message_id, original_filename FROM videos WHERE token = $1",
+            "SELECT token, channel_message_id, original_filename, media_type FROM videos WHERE token = $1",
             token,
         )
         return dict(row) if row else None
+
+
+def _guess_image_suffix(filename: str | None, mime_type: str | None = None) -> str:
+    if filename:
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+            return suffix
+    mime_type = (mime_type or "").lower()
+    if "png" in mime_type:
+        return ".png"
+    if "webp" in mime_type:
+        return ".webp"
+    if "jpeg" in mime_type or "jpg" in mime_type:
+        return ".jpg"
+    return ".jpg"
+
+
+def _media_kind(message: Message) -> str | None:
+    if message.video:
+        return "video"
+    if message.document and (message.document.mime_type or "").startswith("video/"):
+        return "video"
+    if message.photo:
+        return "photo"
+    if message.document and (message.document.mime_type or "").startswith("image/"):
+        return "image_document"
+    return None
+
+
+def _media_noun(media_type: str) -> str:
+    return "عکس" if media_type != "video" else "ویدیو"
+
+
+def _media_caption_label(media_type: str) -> str:
+    return "photo" if media_type != "video" else "video"
+
+
+async def download_admin_image(message: Message) -> tuple[str, str, int]:
+    if message.photo:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        filename = "photo.jpg"
+        file_size = photo.file_size or 0
+        suffix = ".jpg"
+    elif message.document:
+        doc = message.document
+        file_id = doc.file_id
+        filename = doc.file_name or "image.jpg"
+        file_size = doc.file_size or 0
+        suffix = _guess_image_suffix(filename, doc.mime_type)
+    else:
+        raise ValueError("این پیام شامل عکس نیست.")
+
+    logger.info(f"===== STARTING IMAGE DOWNLOAD =====")
+    logger.info(f"File: {filename}, Size: {file_size} bytes, ID: {file_id}")
+
+    file = await message.bot.get_file(file_id)
+    file_path = file.file_path
+    if not file_path:
+        raise ValueError("آدرس فایل دریافت نشد.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        await message.bot.download_file(file_path, destination=tmp_path)
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 100:
+            raise ValueError("دانلود عکس ناموفق بود.")
+        return tmp_path, filename, file_size
+    except Exception:
+        safe_unlink(tmp_path)
+        raise
+
+
+def render_image_with_watermark(
+    input_path: str,
+    watermark_path: str,
+    output_path: str,
+) -> None:
+    frame = Image.open(input_path).convert("RGB")
+    watermark = Image.open(watermark_path).convert("RGBA")
+    out = _overlay_watermark(frame, watermark, percent=100)
+    out.save(output_path, quality=95)
 
 
 # -----------------------------------------------------------------------------
@@ -664,14 +752,19 @@ async def send_join_required_prompt(message: Message, payload: str = "") -> None
     await message.answer(text, reply_markup=build_join_keyboard(entries, payload))
 
 
-async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
+async def deliver_user_media(bot: Bot, chat_id: int, token: str) -> None:
     mapping = await get_video_mapping(db_pool, token)
     if not mapping:
-        await bot.send_message(chat_id, "این لینک نامعتبر است یا ویدیو دیگر در دسترس نیست.")
+        await bot.send_message(chat_id, "این لینک نامعتبر است یا فایل دیگر در دسترس نیست.")
         return
+
+    media_type = str(mapping.get("media_type") or "video")
+    noun = _media_noun(media_type)
+
     warning = await bot.send_message(
         chat_id,
-        "⚠️ ویدیو را همین حالا ذخیره کنید.\n"
+        f"⚠️ {noun} را همین حالا ذخیره کنید.\n"
+        "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
         "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
     )
     try:
@@ -682,7 +775,7 @@ async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
         )
         copied_message_id = copied.message_id if hasattr(copied, "message_id") else copied
     except TelegramBadRequest:
-        await warning.edit_text("ویدیو در کانال ذخیره‌سازی در دسترس نیست.")
+        await warning.edit_text(f"{noun} در کانال ذخیره‌سازی در دسترس نیست.")
         return
     except TelegramForbiddenError:
         await warning.edit_text("امکان ارسال پیام به این کاربر وجود ندارد.")
@@ -692,13 +785,17 @@ async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
     )
 
 
+async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
+    await deliver_user_media(bot, chat_id, token)
+
+
 async def handle_user_start_flow(message: Message, payload: str) -> None:
     missing = await get_missing_joins(message.bot, message.from_user.id)
     if missing:
         await send_join_required_prompt(message, payload)
         return
     if payload:
-        await deliver_user_video(message.bot, message.chat.id, payload)
+        await deliver_user_media(message.bot, message.chat.id, payload)
     else:
         await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
 
@@ -978,11 +1075,11 @@ async def download_file_with_telethon_from_message(
 # -----------------------------------------------------------------------------
 
 def _is_video_message(message: Message) -> bool:
-    if message.video:
-        return True
-    if message.document and (message.document.mime_type or "").startswith("video/"):
-        return True
-    return False
+    return _media_kind(message) == "video"
+
+
+def _is_image_message(message: Message) -> bool:
+    return _media_kind(message) in {"photo", "image_document"}
 
 
 async def download_admin_video(message: Message) -> tuple[str, str, int]:
@@ -1109,7 +1206,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     if not payload:
         await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
         return
-    await deliver_user_video(message.bot, message.chat.id, payload)
+    await deliver_user_media(message.bot, message.chat.id, payload)
 
 
 # ========== هندلر لینک تلگرام ==========
@@ -1217,9 +1314,9 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
         JOBS[job_id] = job
 
         caption = (
-            "🖼 <b>Choose the watermark size for this video</b>\n\n"
+            f"🖼 <b>Choose the watermark size for this {media_label}</b>\n\n"
             "The watermark position is fixed to <b>bottom-right</b>.\n"
-            "The chosen size will apply only to this video."
+            f"The chosen size will apply only to this {media_label}."
         )
         await message.answer_photo(
             FSInputFile(collage_path),
@@ -1264,7 +1361,7 @@ async def cb_join_check(call: CallbackQuery) -> None:
     except Exception:
         pass
     if payload and payload != "_":
-        await deliver_user_video(call.bot, call.message.chat.id, payload)
+        await deliver_user_media(call.bot, call.message.chat.id, payload)
     else:
         await call.message.answer("✅ عضویت شما تأیید شد. حالا می‌توانید دوباره از ربات استفاده کنید.")
 
@@ -1497,16 +1594,18 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 # Video entry handler
 # -----------------------------------------------------------------------------
 
-@router.message(StateFilter(None), F.video | F.document)
-async def admin_video_entry(message: Message, state: FSMContext) -> None:
+@router.message(StateFilter(None), F.video | F.photo | F.document)
+async def admin_media_entry(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
 
     if await state.get_state() is not None:
         return
 
-    if not _is_video_message(message):
+    media_kind = _media_kind(message)
+    if media_kind is None:
         return
+
     settings = await get_watermark(db_pool)
     if not settings:
         await message.answer("Please set the watermark first using the admin panel.")
@@ -1515,12 +1614,16 @@ async def admin_video_entry(message: Message, state: FSMContext) -> None:
         await message.answer("Database is not ready yet.")
         return
 
-    await message.answer("⏳ Reading your video and generating the preview collage...")
+    media_label = _media_noun(media_kind)
+    await message.answer(f"⏳ Reading your {media_label} and generating the preview collage...")
 
     try:
-        video_path, original_name, _ = await download_admin_video(message)
+        if media_kind == "video":
+            source_path, original_name, _ = await download_admin_video(message)
+        else:
+            source_path, original_name, _ = await download_admin_image(message)
     except Exception as exc:
-        await message.answer(f"❌ دانلود ویدیو ناموفق بود:\n{exc}")
+        await message.answer(f"❌ دانلود {media_label} ناموفق بود:\n{exc}")
         return
 
     job_id = secrets.token_hex(4)
@@ -1529,31 +1632,43 @@ async def admin_video_entry(message: Message, state: FSMContext) -> None:
     collage_path = str(Path(temp_dir) / "collage.jpg")
 
     try:
-        await extract_frame(video_path, frame_path, at_seconds=1.0)
-        with Image.open(frame_path) as im:
-            frame_width, frame_height = im.size
+        if media_kind == "video":
+            await extract_frame(source_path, frame_path, at_seconds=1.0)
+            with Image.open(frame_path) as im:
+                frame_width, frame_height = im.size
+            preview_source = frame_path
+        else:
+            with Image.open(source_path) as im:
+                frame_width, frame_height = im.size
+            preview_source = source_path
 
         def _build() -> tuple[int, int]:
-            return build_preview_collage(frame_path, settings[0], collage_path)
+            return build_preview_collage(
+                preview_source,
+                settings[0],
+                collage_path,
+                title=f"Choose watermark size for this {media_label}",
+            )
 
         base_w, base_h = await asyncio.to_thread(_build)
 
         job = Job(
             job_id=job_id,
             admin_id=message.from_user.id,
-            source_path=video_path,
+            source_path=source_path,
             source_filename=original_name,
-            frame_path=frame_path,
+            frame_path=frame_path if media_kind == "video" else source_path,
             preview_path=collage_path,
             frame_width=base_w,
             frame_height=base_h,
+            media_type=media_kind,
         )
         JOBS[job_id] = job
 
         caption = (
-            "🖼 <b>Choose the watermark size for this video</b>\n\n"
+            f"🖼 <b>Choose the watermark size for this {media_label}</b>\n\n"
             "The watermark position is fixed to <b>bottom-right</b>.\n"
-            "The chosen size will apply only to this video."
+            f"The chosen size will apply only to this {media_label}."
         )
         await message.answer_photo(
             FSInputFile(collage_path),
@@ -1562,7 +1677,7 @@ async def admin_video_entry(message: Message, state: FSMContext) -> None:
         )
     except Exception as exc:
         await message.answer(f"Failed to create preview: {exc}")
-        safe_unlink(video_path)
+        safe_unlink(source_path)
         shutil.rmtree(temp_dir, ignore_errors=True)
         if job_id in JOBS:
             JOBS.pop(job_id, None)
@@ -1618,7 +1733,10 @@ async def process_job(bot: Bot, job_id: str) -> None:
         selected_percent = PREVIEW_SIZES[job.chosen_index or 0]
         temp_dir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
         resized_wm_path = str(temp_dir / "watermark.png")
-        output_path = str(temp_dir / "final.mp4")
+        if job.media_type == "video":
+            output_path = str(temp_dir / "final.mp4")
+        else:
+            output_path = str(temp_dir / "final.jpg")
         try:
             await asyncio.to_thread(
                 resize_watermark_for_video,
@@ -1627,35 +1745,58 @@ async def process_job(bot: Bot, job_id: str) -> None:
                 job.frame_width,
                 resized_wm_path,
             )
+            media_label = _media_noun(job.media_type)
             await bot.send_message(
                 job.admin_id,
-                f"⏳ Rendering video with <b>{selected_percent}%</b> watermark..."
+                f"⏳ Rendering {media_label} with <b>{selected_percent}%</b> watermark..."
             )
-            await render_video_with_watermark(
-                input_path=job.source_path,
-                watermark_path=resized_wm_path,
-                output_path=output_path,
-                selected_percent=selected_percent,
-                frame_width=job.frame_width,
-            )
+            if job.media_type == "video":
+                await render_video_with_watermark(
+                    input_path=job.source_path,
+                    watermark_path=resized_wm_path,
+                    output_path=output_path,
+                    selected_percent=selected_percent,
+                    frame_width=job.frame_width,
+                )
+            else:
+                await asyncio.to_thread(
+                    render_image_with_watermark,
+                    job.source_path,
+                    resized_wm_path,
+                    output_path,
+                )
             token = make_token()
-            sent = await bot.send_video(
-                chat_id=STORAGE_CHANNEL,
-                video=FSInputFile(output_path),
-                caption=f"Watermarked video ({selected_percent}%)",
-                supports_streaming=True,
-            )
+            if job.media_type == "video":
+                sent = await bot.send_video(
+                    chat_id=STORAGE_CHANNEL,
+                    video=FSInputFile(output_path),
+                    caption=f"Watermarked video ({selected_percent}%)",
+                    supports_streaming=True,
+                )
+            elif job.media_type == "photo":
+                sent = await bot.send_photo(
+                    chat_id=STORAGE_CHANNEL,
+                    photo=FSInputFile(output_path),
+                    caption=f"Watermarked photo ({selected_percent}%)",
+                )
+            else:
+                sent = await bot.send_document(
+                    chat_id=STORAGE_CHANNEL,
+                    document=FSInputFile(output_path),
+                    caption=f"Watermarked photo ({selected_percent}%)",
+                )
             channel_message_id = sent.message_id
             await save_video_mapping(
                 db_pool,
                 token=token,
                 channel_message_id=channel_message_id,
                 original_filename=job.source_filename,
+                media_type=job.media_type,
             )
             link = build_start_link(token)
             await bot.send_message(
                 job.admin_id,
-                "✅ Video stored in the channel.\n"
+                f"✅ {media_label.capitalize()} stored in the channel.\n"
                 f"🔗 Link:\n<code>{link}</code>"
             )
             job.status = "done"
