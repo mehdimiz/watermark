@@ -6,6 +6,7 @@ import re
 import secrets
 import shutil
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -218,9 +219,10 @@ async def render_video_with_watermark(
     cmd = [
         FFMPEG, "-y",
         "-i", input_path,
+        "-loop", "1",
         "-i", watermark_path,
         "-filter_complex",
-        f"[0:v]scale={target_width}:-2,format=yuv420p[base];[1:v]scale={watermark_width}:-1[wm];[base][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto[v]",
+        f"[0:v]scale={target_width}:-2,format=yuv420p[base];[1:v]scale={watermark_width}:-1,format=rgba[wm];[base][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto[v]",
         "-map", "[v]",
         "-map", "0:a?",
         "-map_metadata", "-1",
@@ -1693,6 +1695,32 @@ async def help_cmd(message: Message) -> None:
         await message.answer("Use the link you received from the admin.")
 
 
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def start_polling_if_needed(app: web.Application) -> None:
+    if should_use_webhook():
+        return
+    bot: Bot = app["bot"]
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    app["polling_task"] = asyncio.create_task(
+        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    )
+
+
+async def stop_polling_if_running(app: web.Application) -> None:
+    task = app.get("polling_task")
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
 # -----------------------------------------------------------------------------
 # Webhook app
 # -----------------------------------------------------------------------------
@@ -1700,11 +1728,7 @@ async def help_cmd(message: Message) -> None:
 
 def should_use_webhook() -> bool:
     flag = _cfg("USE_WEBHOOK")
-    if flag.lower() in {"0", "false", "no", "off"}:
-        return False
-    if flag.lower() in {"1", "true", "yes", "on"}:
-        return True
-    return bool(WEBHOOK_BASE_URL)
+    return flag.lower() in {"1", "true", "yes", "on"}
 
 
 async def startup_common(bot: Bot) -> None:
@@ -1790,7 +1814,13 @@ async def on_shutdown(bot: Bot) -> None:
 
 async def init_app() -> web.Application:
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1, statement_cache_size=0, command_timeout=60)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=1,
+        statement_cache_size=0,
+        command_timeout=60,
+    )
     await init_db(db_pool)
     bot = Bot(
         token=BOT_TOKEN,
@@ -1798,10 +1828,18 @@ async def init_app() -> web.Application:
     )
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
+
     app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
     app["bot"] = bot
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    app.on_startup.append(start_polling_if_needed)
+    app.on_cleanup.append(stop_polling_if_running)
+
+    if should_use_webhook():
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+
     return app
 
 
@@ -1819,9 +1857,8 @@ async def run_polling() -> None:
 
 
 def main() -> None:
-    if should_use_webhook():
-        web.run_app(init_app(), host="0.0.0.0", port=PORT)
-    else:
-        asyncio.run(run_polling())
+    web.run_app(init_app(), host="0.0.0.0", port=PORT)
+
+
 if __name__ == "__main__":
     main()
