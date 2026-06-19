@@ -19,7 +19,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1111,7 +1111,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 # ========== هندلر لینک تلگرام ==========
-@router.message(F.text & F.chat.type == "private")
+@router.message(StateFilter(None), F.text & F.chat.type == "private")
 async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
@@ -1276,7 +1276,8 @@ async def cb_join_add(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(
         "لطفاً لینک‌های جوین اجباری را ارسال کنید.\n"
         "هر لینک در یک خط جداگانه باشد.\n"
-        "از @username یا لینک public t.me استفاده کنید."
+        "از @username یا لینک public t.me استفاده کنید.\n\n"
+        "بعد از ارسال، ربات باید پیام تایید بدهد."
     )
     await call.answer()
 
@@ -1365,6 +1366,7 @@ async def receive_join_links(message: Message, state: FSMContext) -> None:
     if not message.text:
         await message.answer("لطفاً لینک‌ها را به صورت متنی ارسال کنید.")
         return
+
     lines = [line.strip() for line in message.text.splitlines() if line.strip()]
     if not lines:
         await message.answer("هیچ لینکی دریافت نشد.")
@@ -1372,10 +1374,12 @@ async def receive_join_links(message: Message, state: FSMContext) -> None:
     if not db_pool:
         await message.answer("Database is not ready yet.")
         return
+
     current = renumber_join_links(await get_join_links(db_pool))
     seen_chat_ids = {item["chat_id"] for item in current}
     added = 0
     errors: list[str] = []
+
     for raw in lines:
         try:
             target = await resolve_join_target(message.bot, raw)
@@ -1386,9 +1390,19 @@ async def receive_join_links(message: Message, state: FSMContext) -> None:
             added += 1
         except Exception as exc:
             errors.append(f"• {raw} → {exc}")
+
     current = renumber_join_links(current)
     await save_join_links(db_pool, current)
     await state.clear()
+
+    if added == 0 and errors:
+        await message.answer(
+            "❌ هیچ لینک معتبری اضافه نشد.\n\n"
+            "⚠️ موارد نامعتبر:\n" + "\n".join(errors[:10])
+        )
+        return
+        return
+
     msg = f"✅ {added} لینک جدید اضافه شد."
     if errors:
         msg += "\n\n⚠️ برخی موارد نامعتبر بودند:\n" + "\n".join(errors[:5])
@@ -1481,7 +1495,7 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 # Video entry handler
 # -----------------------------------------------------------------------------
 
-@router.message(F.video | F.document)
+@router.message(StateFilter(None), F.video | F.document)
 async def admin_video_entry(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
