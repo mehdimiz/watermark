@@ -49,19 +49,42 @@ except Exception:
 # Configuration
 # -----------------------------------------------------------------------------
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8883527571"))
-STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL", "-1003890591020"))
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip()
-WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
-PORT = int(os.getenv("PORT", "8080"))
+CONFIG_FILE = Path(__file__).with_name("config.json")
+
+
+def _load_local_config() -> dict[str, Any]:
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+LOCAL_CONFIG = _load_local_config()
+
+
+def _cfg(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        value = LOCAL_CONFIG.get(name, default)
+    return str(value).strip()
+
+
+ADMIN_ID = int(_cfg("ADMIN_ID", "8883527571"))
+STORAGE_CHANNEL = int(_cfg("STORAGE_CHANNEL", "-1003890591020"))
+BOT_TOKEN = _cfg("BOT_TOKEN")
+DATABASE_URL = _cfg("DATABASE_URL")
+BOT_USERNAME_ENV = _cfg("BOT_USERNAME")
+WEBHOOK_BASE_URL = _cfg("WEBHOOK_BASE_URL") or _cfg("RENDER_EXTERNAL_URL")
+WEBHOOK_PATH = _cfg("WEBHOOK_PATH", "/webhook")
+PORT = int(_cfg("PORT", "8080"))
 
 # Telethon credentials (for userbot session)
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "").strip()
-USER_SESSION_STRING = os.getenv("USER_SESSION_STRING", "").strip()
+API_ID = int(_cfg("API_ID", "0"))
+API_HASH = _cfg("API_HASH")
+USER_SESSION_STRING = _cfg("USER_SESSION_STRING", "")
 
 if not API_ID or not API_HASH:
     logging.warning("API_ID and API_HASH are not set. Telethon will not work.")
@@ -626,6 +649,11 @@ async def send_join_required_prompt(message: Message, payload: str = "") -> None
     entries = renumber_join_links(await get_join_links(db_pool))
     if not entries:
         return
+
+    missing = await get_missing_joins(message.bot, message.from_user.id)
+    if missing:
+        entries = missing
+
     text = (
         "⚠️ <b>برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شوید:</b>\n\n"
         f"{format_join_list(entries)}\n\n"
@@ -1088,7 +1116,8 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
 
-    if await state.get_state() == WatermarkState.waiting_for_png.state:
+    current_state = await state.get_state()
+    if current_state is not None:
         return
 
     text = message.text.strip()
@@ -1220,7 +1249,7 @@ async def cb_join_check(call: CallbackQuery) -> None:
         try:
             await call.message.edit_reply_markup(
                 reply_markup=build_join_keyboard(
-                    renumber_join_links(await get_join_links(db_pool)),
+                    missing,
                     payload if payload != "_" else ""
                 )
             )
@@ -1456,8 +1485,10 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 async def admin_video_entry(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
-    if await state.get_state() == WatermarkState.waiting_for_png.state:
+
+    if await state.get_state() is not None:
         return
+
     if not _is_video_message(message):
         return
     settings = await get_watermark(db_pool)
@@ -1652,7 +1683,17 @@ async def help_cmd(message: Message) -> None:
 # Webhook app
 # -----------------------------------------------------------------------------
 
-async def on_startup(bot: Bot) -> None:
+
+def should_use_webhook() -> bool:
+    flag = _cfg("USE_WEBHOOK")
+    if flag.lower() in {"0", "false", "no", "off"}:
+        return False
+    if flag.lower() in {"1", "true", "yes", "on"}:
+        return True
+    return bool(WEBHOOK_BASE_URL)
+
+
+async def startup_common(bot: Bot) -> None:
     global telethon_client, db_pool
 
     await ensure_bot_username(bot)
@@ -1677,30 +1718,33 @@ async def on_startup(bot: Bot) -> None:
     else:
         logger.warning("API_ID, API_HASH, or USER_SESSION_STRING not set. Large file downloads will not work.")
 
-    # ========== تنظیم خودکار وب‌هوک ==========
-    # اولویت 1: RENDER_EXTERNAL_URL (متغیر خودکار Render)
-    webhook_base = os.getenv("RENDER_EXTERNAL_URL", "").strip()
-    if not webhook_base:
-        # اولویت 2: WEBHOOK_BASE_URL (تنظیم دستی توسط کاربر)
-        webhook_base = WEBHOOK_BASE_URL
 
-    if webhook_base:
-        webhook_url = webhook_base.rstrip("/") + WEBHOOK_PATH
-        try:
-            await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            logger.info(f"✅ Webhook successfully set to: {webhook_url}")
-        except Exception as e:
-            logger.error(f"❌ Failed to set webhook: {e}")
-            logger.warning("⚠️ Please set webhook manually using:\n"
-                           f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
+async def on_startup(bot: Bot) -> None:
+    await startup_common(bot)
+
+    if should_use_webhook():
+        if WEBHOOK_BASE_URL:
+            webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
+            try:
+                await bot.set_webhook(webhook_url, drop_pending_updates=True)
+                logger.info(f"✅ Webhook successfully set to: {webhook_url}")
+            except Exception as e:
+                logger.error(f"❌ Failed to set webhook: {e}")
+                logger.warning(
+                    "⚠️ Failed to auto-set webhook. The bot will still continue, "
+                    "but you may need to expose a public URL."
+                )
+        else:
+            logger.warning(
+                "⚠️ Webhook mode is enabled, but no public URL was found.\n"
+                "Set WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL, or disable USE_WEBHOOK."
+            )
     else:
-        logger.warning(
-            "⚠️ Neither RENDER_EXTERNAL_URL nor WEBHOOK_BASE_URL is set.\n"
-            "Webhook will not be registered automatically.\n"
-            "Please set WEBHOOK_BASE_URL environment variable or use polling.\n"
-            f"To set webhook manually, use:\n"
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url=YOUR_WEBHOOK_URL"
-        )
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        logger.info("Polling mode active: webhook has been cleared automatically.")
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -1747,9 +1791,23 @@ async def init_app() -> web.Application:
     return app
 
 
+async def run_polling() -> None:
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1, statement_cache_size=0, command_timeout=60)
+    await init_db(db_pool)
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
 def main() -> None:
-    web.run_app(init_app(), host="0.0.0.0", port=PORT)
-
-
+    if should_use_webhook():
+        web.run_app(init_app(), host="0.0.0.0", port=PORT)
+    else:
+        asyncio.run(run_polling())
 if __name__ == "__main__":
     main()
