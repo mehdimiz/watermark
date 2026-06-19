@@ -261,16 +261,26 @@ def _resize_watermark(wm: Image.Image, target_w: int) -> Image.Image:
     return wm.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
 
+def _reference_length(base: Image.Image, reference: str) -> int:
+    reference = (reference or "width").lower()
+    if reference == "short":
+        return min(base.width, base.height)
+    return base.width
+
+
 def _overlay_watermark(
     frame: Image.Image,
     watermark: Image.Image,
     percent: int,
     margin: int = WATERMARK_MARGIN,
+    reference: str = "width",
 ) -> Image.Image:
     base = frame.convert("RGBA")
     wm = watermark.convert("RGBA")
-    target_w = max(64, int(base.width * percent / 100))
-    target_w = min(target_w, max(64, base.width - 2 * margin))
+    ref_len = _reference_length(base, reference)
+    target_w = max(64, int(ref_len * percent / 100))
+    max_w = max(64, ref_len - 2 * margin)
+    target_w = min(target_w, max_w)
     wm = _resize_watermark(wm, target_w)
     x = base.width - wm.width - margin
     y = base.height - wm.height - margin
@@ -285,6 +295,7 @@ def build_preview_collage(
     watermark_bytes: bytes,
     out_path: str,
     title: str = "Choose watermark size for this video",
+    reference: str = "width",
 ) -> tuple[int, int]:
     frame = Image.open(frame_path).convert("RGB")
     watermark = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
@@ -294,7 +305,7 @@ def build_preview_collage(
     labels = ["Small", "Medium", "Large", "XL"]
     for idx, percent in enumerate(PREVIEW_SIZES):
         tile = ImageOps.fit(frame, PREVIEW_TILE_SIZE, method=Image.Resampling.LANCZOS)
-        tile = _overlay_watermark(tile, watermark, percent=percent)
+        tile = _overlay_watermark(tile, watermark, percent=percent, reference=reference)
         draw = ImageDraw.Draw(tile)
         font = _load_font(22)
         label = f"{labels[idx]}  ({percent}%)"
@@ -344,8 +355,24 @@ def resize_watermark_for_video(
     out_path: str,
 ) -> None:
     wm = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
-    target_w = max(64, int(min(frame_width, OUTPUT_MAX_WIDTH) * selected_percent / 100))
-    target_w = min(target_w, max(64, min(frame_width, OUTPUT_MAX_WIDTH) - 40))
+    ref_len = min(frame_width, OUTPUT_MAX_WIDTH)
+    target_w = max(64, int(ref_len * selected_percent / 100))
+    target_w = min(target_w, max(64, ref_len - 40))
+    resized = _resize_watermark(wm, target_w)
+    resized.save(out_path, format="PNG")
+
+
+def resize_watermark_for_image(
+    watermark_bytes: bytes,
+    selected_percent: int,
+    frame_width: int,
+    frame_height: int,
+    out_path: str,
+) -> None:
+    wm = Image.open(BytesIO(watermark_bytes)).convert("RGBA")
+    ref_len = min(frame_width, frame_height, OUTPUT_MAX_WIDTH)
+    target_w = max(64, int(ref_len * selected_percent / 100))
+    target_w = min(target_w, max(64, ref_len - 40))
     resized = _resize_watermark(wm, target_w)
     resized.save(out_path, format="PNG")
 
@@ -391,6 +418,12 @@ async def init_db(pool: asyncpg.Pool) -> None:
             );
             """
         )
+        try:
+            await conn.execute(
+                "ALTER TABLE videos ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT 'video';"
+            )
+        except Exception:
+            pass
         
         await conn.execute(
             """
@@ -1314,9 +1347,9 @@ async def handle_telegram_link(message: Message, state: FSMContext) -> None:
         JOBS[job_id] = job
 
         caption = (
-            f"🖼 <b>Choose the watermark size for this {media_label}</b>\n\n"
+            "🖼 <b>Choose the watermark size for this video</b>\n\n"
             "The watermark position is fixed to <b>bottom-right</b>.\n"
-            f"The chosen size will apply only to this {media_label}."
+            "The chosen size will apply only to this video."
         )
         await message.answer_photo(
             FSInputFile(collage_path),
@@ -1648,6 +1681,7 @@ async def admin_media_entry(message: Message, state: FSMContext) -> None:
                 settings[0],
                 collage_path,
                 title=f"Choose watermark size for this {media_label}",
+                reference="short" if media_kind != "video" else "width",
             )
 
         base_w, base_h = await asyncio.to_thread(_build)
@@ -1666,9 +1700,9 @@ async def admin_media_entry(message: Message, state: FSMContext) -> None:
         JOBS[job_id] = job
 
         caption = (
-            f"🖼 <b>Choose the watermark size for this {media_label}</b>\n\n"
+            "🖼 <b>Choose the watermark size for this video</b>\n\n"
             "The watermark position is fixed to <b>bottom-right</b>.\n"
-            f"The chosen size will apply only to this {media_label}."
+            "The chosen size will apply only to this video."
         )
         await message.answer_photo(
             FSInputFile(collage_path),
@@ -1738,14 +1772,25 @@ async def process_job(bot: Bot, job_id: str) -> None:
         else:
             output_path = str(temp_dir / "final.jpg")
         try:
-            await asyncio.to_thread(
-                resize_watermark_for_video,
-                watermark_bytes,
-                selected_percent,
-                job.frame_width,
-                resized_wm_path,
-            )
             media_label = _media_noun(job.media_type)
+            if job.media_type == "video":
+                await asyncio.to_thread(
+                    resize_watermark_for_video,
+                    watermark_bytes,
+                    selected_percent,
+                    job.frame_width,
+                    resized_wm_path,
+                )
+            else:
+                await asyncio.to_thread(
+                    resize_watermark_for_image,
+                    watermark_bytes,
+                    selected_percent,
+                    job.frame_width,
+                    job.frame_height,
+                    resized_wm_path,
+                )
+
             await bot.send_message(
                 job.admin_id,
                 f"⏳ Rendering {media_label} with <b>{selected_percent}%</b> watermark..."
