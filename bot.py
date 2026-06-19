@@ -624,10 +624,26 @@ def render_image_with_watermark(
     watermark_path: str,
     output_path: str,
 ) -> None:
-    frame = Image.open(input_path).convert("RGB")
+    frame = Image.open(input_path).convert("RGBA")
     watermark = Image.open(watermark_path).convert("RGBA")
-    out = _overlay_watermark(frame, watermark, percent=100)
-    out.save(output_path, quality=95)
+
+    # The watermark is already resized by resize_watermark_for_image().
+    # Here we only paste it in the bottom-right corner so the final output
+    # keeps the exact selected size from the preview.
+    margin = WATERMARK_MARGIN
+    x = max(0, frame.width - watermark.width - margin)
+    y = max(0, frame.height - watermark.height - margin)
+
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    overlay.paste(watermark, (x, y), watermark)
+    out = Image.alpha_composite(frame, overlay).convert("RGB")
+
+    suffix = Path(output_path).suffix.lower()
+    save_kwargs = {"quality": 95}
+    if suffix in {".jpg", ".jpeg"}:
+        save_kwargs.update({"optimize": True, "progressive": True})
+
+    out.save(output_path, **save_kwargs)
 
 
 # -----------------------------------------------------------------------------
