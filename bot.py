@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import os
@@ -814,7 +815,6 @@ async def deliver_user_media(bot: Bot, chat_id: int, token: str) -> None:
         chat_id,
         f"⚠️ {noun} را همین حالا ذخیره کنید.\n"
         "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
-        "این پیام تا ۱۰ ثانیه دیگر به صورت خودکار حذف خواهد شد."
     )
     try:
         copied = await bot.copy_message(
@@ -834,8 +834,96 @@ async def deliver_user_media(bot: Bot, chat_id: int, token: str) -> None:
     )
 
 
-async def deliver_user_video(bot: Bot, chat_id: int, token: str) -> None:
-    await deliver_user_media(bot, chat_id, token)
+def _source_filename_from_message(message: Message, media_kind: str) -> str:
+    if media_kind == "video":
+        if message.video and message.video.file_name:
+            return message.video.file_name
+        if message.document and message.document.file_name:
+            return message.document.file_name
+        return "video.mp4"
+
+    if message.photo:
+        return "photo.jpg"
+
+    if message.document and message.document.file_name:
+        return message.document.file_name
+
+    return "image.jpg"
+
+
+async def notify_admin_about_user_media(bot: Bot, message: Message, media_kind: str) -> None:
+    if not message.from_user:
+        return
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "ندارد"
+    full_name = html.escape(message.from_user.full_name or "ناشناس")
+    noun = _media_noun(media_kind)
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            (
+                "📥 <b>ثبت مدیا توسط کاربر</b>\n\n"
+                f"نام: <b>{full_name}</b>\n"
+                f"یوزرنیم: <code>{username}</code>\n"
+                f"آیدی: <code>{message.from_user.id}</code>\n"
+                f"نوع مدیا: <b>{noun}</b>"
+            ),
+        )
+    except Exception:
+        logger.warning("Failed to send user media report to admin.", exc_info=True)
+
+
+async def handle_user_media_submission(message: Message, media_kind: str) -> None:
+    if not db_pool:
+        await message.answer("Database is not ready yet.")
+        return
+
+    missing = await get_missing_joins(message.bot, message.from_user.id)
+    if missing:
+        await send_join_required_prompt(message)
+        return
+
+    media_label = _media_noun(media_kind)
+    await message.answer(f"⏳ در حال ثبت {media_label} شما بدون واترمارک...")
+
+    copied_message_id: int | None = None
+    try:
+        copied = await message.bot.copy_message(
+            chat_id=STORAGE_CHANNEL,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        copied_message_id = copied.message_id if hasattr(copied, "message_id") else int(copied)
+
+        token = make_token()
+        original_filename = _source_filename_from_message(message, media_kind)
+        await save_video_mapping(
+            db_pool,
+            token=token,
+            channel_message_id=copied_message_id,
+            original_filename=original_filename,
+            media_type=media_kind,
+        )
+
+        link = build_start_link(token)
+        await message.answer(
+            f"✅ {media_label} شما ثبت شد.\n"
+            f"🔗 لینک دریافت:\n<code>{link}</code>"
+        )
+        await notify_admin_about_user_media(message.bot, message, media_kind)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        if copied_message_id is not None:
+            with suppress(Exception):
+                await message.bot.delete_message(STORAGE_CHANNEL, copied_message_id)
+        logger.warning("User media registration failed: %s", exc)
+        await message.answer("❌ ثبت مدیا ناموفق بود. لطفاً دوباره تلاش کنید.")
+    except Exception as exc:
+        if copied_message_id is not None:
+            with suppress(Exception):
+                await message.bot.delete_message(STORAGE_CHANNEL, copied_message_id)
+        logger.exception("Unexpected error while registering user media")
+        await message.answer(f"❌ ثبت مدیا ناموفق بود:\n{exc}")
 
 
 async def handle_user_start_flow(message: Message, payload: str) -> None:
@@ -846,7 +934,12 @@ async def handle_user_start_flow(message: Message, payload: str) -> None:
     if payload:
         await deliver_user_media(message.bot, message.chat.id, payload)
     else:
-        await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
+        await message.answer("می‌توانید عکس یا ویدیوی خود را مستقیم برای ربات بفرستید تا ثبت شود و لینک دریافت کنید.")
+
+
+# -----------------------------------------------------------------------------
+# Admin UI (با دکمه لاگین)
+# -----------------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------------
@@ -1228,7 +1321,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         if payload:
             await message.answer("پنل ادمین", reply_markup=admin_keyboard())
             return
-        
+
         data = await get_user_data(message.from_user.id)
         is_logged_in = data and data.get('session_string')
         login_status = "✅ لاگین هستید" if is_logged_in else "❌ لاگین نیستید"
@@ -1237,7 +1330,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             has_wm = bool(settings.get("watermark_png"))
         except Exception:
             has_wm = False
-            
+
         text = (
             "👋 <b>پنل ادمین</b>\n\n"
             f"🟢 واترمارک: <b>{'ذخیره شده' if has_wm else 'تنظیم نشده'}</b>\n"
@@ -1247,15 +1340,18 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         )
         await message.answer(text, reply_markup=admin_keyboard())
         return
-    
+
     missing = await get_missing_joins(message.bot, message.from_user.id)
     if missing:
         await send_join_required_prompt(message, payload)
         return
     if not payload:
-        await message.answer("لطفاً لینک ربات را از ادمین دریافت کنید.")
+        await message.answer("می‌توانید عکس یا ویدیوی خود را مستقیم برای ربات بفرستید تا ثبت شود و لینک دریافت کنید.")
         return
     await deliver_user_media(message.bot, message.chat.id, payload)
+
+
+# ========== هندلر لینک تلگرام ==========
 
 
 # ========== هندلر لینک تلگرام ==========
@@ -1645,9 +1741,6 @@ async def receive_watermark(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(None), F.video | F.photo | F.document)
 async def admin_media_entry(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        return
-
     if await state.get_state() is not None:
         return
 
@@ -1655,82 +1748,86 @@ async def admin_media_entry(message: Message, state: FSMContext) -> None:
     if media_kind is None:
         return
 
-    settings = await get_watermark(db_pool)
-    if not settings:
-        await message.answer("Please set the watermark first using the admin panel.")
-        return
-    if not db_pool:
-        await message.answer("Database is not ready yet.")
-        return
+    if is_admin(message.from_user.id):
+        settings = await get_watermark(db_pool)
+        if not settings:
+            await message.answer("Please set the watermark first using the admin panel.")
+            return
+        if not db_pool:
+            await message.answer("Database is not ready yet.")
+            return
 
-    media_label = _media_noun(media_kind)
-    await message.answer(f"⏳ Reading your {media_label} and generating the preview collage...")
+        media_label = _media_noun(media_kind)
+        await message.answer(f"⏳ Reading your {media_label} and generating the preview collage...")
 
-    try:
-        if media_kind == "video":
-            source_path, original_name, _ = await download_admin_video(message)
-        else:
-            source_path, original_name, _ = await download_admin_image(message)
-    except Exception as exc:
-        await message.answer(f"❌ دانلود {media_label} ناموفق بود:\n{exc}")
-        return
+        try:
+            if media_kind == "video":
+                source_path, original_name, _ = await download_admin_video(message)
+            else:
+                source_path, original_name, _ = await download_admin_image(message)
+        except Exception as exc:
+            await message.answer(f"❌ دانلود {media_label} ناموفق بود:\n{exc}")
+            return
 
-    job_id = secrets.token_hex(4)
-    temp_dir = tempfile.mkdtemp(prefix=f"wmjob_{job_id}_")
-    frame_path = str(Path(temp_dir) / "frame.jpg")
-    collage_path = str(Path(temp_dir) / "collage.jpg")
+        job_id = secrets.token_hex(4)
+        temp_dir = tempfile.mkdtemp(prefix=f"wmjob_{job_id}_")
+        frame_path = str(Path(temp_dir) / "frame.jpg")
+        collage_path = str(Path(temp_dir) / "collage.jpg")
 
-    try:
-        if media_kind == "video":
-            await extract_frame(source_path, frame_path, at_seconds=1.0)
-            with Image.open(frame_path) as im:
-                frame_width, frame_height = im.size
-            preview_source = frame_path
-        else:
-            with Image.open(source_path) as im:
-                frame_width, frame_height = im.size
-            preview_source = source_path
+        try:
+            if media_kind == "video":
+                await extract_frame(source_path, frame_path, at_seconds=1.0)
+                with Image.open(frame_path) as im:
+                    frame_width, frame_height = im.size
+                preview_source = frame_path
+            else:
+                with Image.open(source_path) as im:
+                    frame_width, frame_height = im.size
+                preview_source = source_path
 
-        def _build() -> tuple[int, int]:
-            return build_preview_collage(
-                preview_source,
-                settings[0],
-                collage_path,
-                title=f"Choose watermark size for this {media_label}",
-                reference="short" if media_kind != "video" else "width",
+            def _build() -> tuple[int, int]:
+                return build_preview_collage(
+                    preview_source,
+                    settings[0],
+                    collage_path,
+                    title=f"Choose watermark size for this {media_label}",
+                    reference="short" if media_kind != "video" else "width",
+                )
+
+            base_w, base_h = await asyncio.to_thread(_build)
+
+            job = Job(
+                job_id=job_id,
+                admin_id=message.from_user.id,
+                source_path=source_path,
+                source_filename=original_name,
+                frame_path=frame_path if media_kind == "video" else source_path,
+                preview_path=collage_path,
+                frame_width=base_w,
+                frame_height=base_h,
+                media_type=media_kind,
             )
+            JOBS[job_id] = job
 
-        base_w, base_h = await asyncio.to_thread(_build)
+            caption = (
+                f"🖼 <b>Choose the watermark size for this {media_label}</b>\n\n"
+                "The watermark position is fixed to <b>bottom-right</b>.\n"
+                "The chosen size will apply only to this media."
+            )
+            await message.answer_photo(
+                FSInputFile(collage_path),
+                caption=caption,
+                reply_markup=size_keyboard(job_id),
+            )
+        except Exception as exc:
+            await message.answer(f"Failed to create preview: {exc}")
+            safe_unlink(source_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if job_id in JOBS:
+                JOBS.pop(job_id, None)
+        return
 
-        job = Job(
-            job_id=job_id,
-            admin_id=message.from_user.id,
-            source_path=source_path,
-            source_filename=original_name,
-            frame_path=frame_path if media_kind == "video" else source_path,
-            preview_path=collage_path,
-            frame_width=base_w,
-            frame_height=base_h,
-            media_type=media_kind,
-        )
-        JOBS[job_id] = job
-
-        caption = (
-            "🖼 <b>Choose the watermark size for this video</b>\n\n"
-            "The watermark position is fixed to <b>bottom-right</b>.\n"
-            "The chosen size will apply only to this video."
-        )
-        await message.answer_photo(
-            FSInputFile(collage_path),
-            caption=caption,
-            reply_markup=size_keyboard(job_id),
-        )
-    except Exception as exc:
-        await message.answer(f"Failed to create preview: {exc}")
-        safe_unlink(source_path)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        if job_id in JOBS:
-            JOBS.pop(job_id, None)
+    await handle_user_media_submission(message, media_kind)
 
 
 @router.callback_query(F.data.startswith("sz:"))
@@ -1894,7 +1991,10 @@ async def help_cmd(message: Message) -> None:
             "4) The bot uploads the final video to the channel and gives you the link."
         )
     else:
-        await message.answer("Use the link you received from the admin.")
+        await message.answer(
+            "می‌توانید عکس یا ویدیوی خود را مستقیم برای ربات بفرستید تا بدون واترمارک ثبت شود و لینک دریافت کنید."
+        )
+
 
 
 async def health_handler(request: web.Request) -> web.Response:
